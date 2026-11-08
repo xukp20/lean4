@@ -126,6 +126,42 @@ private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :
         exportedInfo? := some <| .axiomInfo { op with }
       pure (op.name, .opaqueInfo op, .opaque)
     | .axiomDecl ax => pure (ax.name, .axiomInfo ax, .axiom)
+    | .inductDecl .. =>
+      if Elab.async.get (← getOptions) && !debug.skipKernelTC.get (← getOptions) then
+        let env ← getEnv
+        match ← env.addInductiveSignature (Core.getMaxHeartbeats (← getOptions)).toUSize
+            (maxRecDepth.get (← getOptions)).toUSize decl (← read).cancelTk? with
+        | .ok async =>
+          trace[addDecl] "inductive signature checked; scheduling complete check"
+          setEnv async.mainEnv
+          let cancelTk ← IO.CancelToken.new
+          let ngen ← getNGen
+          let declNGen ← getDeclNGen
+          -- The kernel checks fixed declaration names. Give this task a separate name supply
+          -- so scheduling it does not advance either generator of the elaborating branch.
+          let checkPrefix := Name.num (.str ngen.namePrefix "_inductiveCheck") ngen.idx ++
+            decl.getTopLevelNames.head!
+          let checkAct ←
+            try
+              setNGen { namePrefix := checkPrefix }
+              setDeclNGen { namePrefix := checkPrefix }
+              Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun _ => do
+                setEnv async.asyncEnv
+                try
+                  doAdd
+                finally
+                  async.commitChecked (← getEnv)
+            finally
+              setNGen ngen
+              setDeclNGen declNGen
+          let t ← BaseIO.mapTask checkAct env.checked
+          Core.logSnapshotTask {
+            stx? := none, reportingRange := .skip, task := t, cancelTk? := cancelTk
+          }
+          return
+        | .error _ =>
+          trace[addDecl] "inductive signature check failed; adding synchronously"
+      return (← doAdd)
     | _ =>
       trace[addDecl] "no matching async adding rules, adding synchronously"
       return (← doAdd)

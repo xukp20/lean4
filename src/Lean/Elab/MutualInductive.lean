@@ -1243,7 +1243,17 @@ private structure FinalizeInductiveDecl where
   reserved names.
 -/
 private def addAuxRecs (indTypes : List InductiveType) : TermElabM Unit := do
+  if let indType :: _ := indTypes then
+    let .inductInfo info ← getConstInfo indType.name | unreachable!
+    let env ← getEnv
+    -- The signature path has already published the complete auxiliary group. A synchronous
+    -- kernel addition alone does not suffice: it may not have published the public entries.
+    let allPublished := (List.range info.numNested).all fun i =>
+      env.containsAsyncOnBranch (indType.name ++ `rec |>.appendIndexAfter (i + 1))
+    if allPublished then return
   for indType in indTypes do
+    let .inductInfo info ← getConstInfo indType.name | unreachable!
+    if info.numNested == 0 then continue
     let mut i := 1
     while true do
       let auxRecName := indType.name ++ `rec |>.appendIndexAfter i
