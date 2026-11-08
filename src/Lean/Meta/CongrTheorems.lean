@@ -472,6 +472,8 @@ def mkCongrSimpForConst? (declName : Name) (levels : List Level) : MetaM (Option
   try
     unless (← getEnv).containsOnBranch thmName do
       let _ ← executeReservedNameAction thmName
+    unless (← getEnv).containsOnBranch thmName do
+      return none
     let proof := mkConst thmName levels
     let type ← inferType proof
     let some argKinds := congrKindsExt.find? (← getEnv) thmName
