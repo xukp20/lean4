@@ -1153,6 +1153,11 @@ not block.
 def containsOnBranch (env : Environment) (n : Name) : Bool :=
   (env.asyncConsts.find? n |>.isSome) || (env.base.get env).constants.contains n
 
+/-- Checks whether a constant has direct asynchronous entries in both visibility scopes, without
+consulting the kernel environment or waiting for another branch. -/
+def containsAsyncOnBranch (env : Environment) (n : Name) : Bool :=
+  (env.asyncConstsMap.private.find? n).isSome && (env.asyncConstsMap.public.find? n).isSome
+
 /--
 Returns the constants added in the current module, in elaboration tree pre-order: the top-level
 declarations in elaboration order, each followed by its asynchronous sub-declarations, recursively.
@@ -1180,6 +1185,61 @@ where
       unless skipTheoremSubDecls && c.constInfo.kind == .thm do
         (acc, seen) ← go c.aconsts.get acc seen
     return (acc, seen)
+
+/-- Returns a temporary kernel environment containing local theorem signatures but not their values. -/
+def toKernelSignature (env : Environment) : BaseIO Kernel.Environment := do
+  let mut signatureEnv := env.base.private
+  for info in ← (env.setExporting false).getLocalConstantInfos (skipTheoremSubDecls := true) do
+    let info := if info.kind == .thm then
+      ConstantInfo.axiomInfo { info.toConstantVal with isUnsafe := false }
+    else
+      info.toConstantInfo
+    signatureEnv := signatureEnv.add info
+  return signatureEnv
+
+/--
+Checks an inductive against local signatures without forcing `checked`, publishes its
+constants, and leaves a promise for an ordered check in the complete environment.
+The caller must perform the complete check on `asyncEnv` and call `commitChecked` even on failure.
+-/
+def addInductiveSignature (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize)
+    (decl : Declaration) (cancelTk? : Option IO.CancelToken) :
+    BaseIO (Except Kernel.Exception PromiseCheckedResult) := do
+  if let some ctx := env.asyncCtx? then
+    if let some n := decl.getTopLevelNames.find? (!ctx.mayContain ·) then
+      return .error <| .other s!"cannot add declaration {n} to environment as it is restricted to the \
+        prefix {ctx.declPrefix}"
+  let signatureEnv ← env.toKernelSignature
+  let signatureResult := signatureEnv.addDeclCore maxHeartbeats maxRecDepth decl cancelTk?
+  match signatureResult with
+  | .error ex => return .error ex
+  | .ok checkedSignature =>
+    let mut names := decl.getNames
+    if let .inductDecl _ _ (indType :: _) _ := decl then
+      let some (.inductInfo info) := checkedSignature.find? indType.name
+        | return .error <| .other "signature kernel did not return an inductive type"
+      -- The kernel names all auxiliary recursors after the first type in the mutual group.
+      let auxNames := (List.range info.numNested).map fun i =>
+        indType.name ++ `rec |>.appendIndexAfter (i + 1)
+      for n in auxNames do
+        unless (checkedSignature.find? n).any (fun c => c matches .recInfo _) do
+          return .error <| .other s!"signature kernel did not return auxiliary recursor {n}"
+      names := names ++ auxNames
+    let mut mainEnv := env
+    for n in names do
+      let info := (checkedSignature.find? n).get!
+      mainEnv := { mainEnv with asyncConstsMap := mainEnv.asyncConstsMap.map (·.add {
+        constInfo := .ofConstantInfo info
+        exts? := none
+        aconstsImpl := .pure <| .mk (α := AsyncConsts) default
+      }) }
+    let res ← env.promiseChecked
+    return .ok { res with
+      mainEnv := { mainEnv with checked := res.mainEnv.checked }
+      -- The declaration may contain multiple inductive names, so a single-name async prefix is
+      -- insufficient. The original branch restriction was checked before the signature check.
+      asyncEnv := env.enterAsync .anonymous
+    }
 
 def setMainModule (env : Environment) (m : Name) : Environment := Id.run do
   let env := env.modifyCheckedAsync ({ · with
