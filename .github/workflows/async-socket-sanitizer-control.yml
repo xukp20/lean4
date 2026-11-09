@@ -1,0 +1,52 @@
+name: Linux sanitizer socket control
+on:
+  push:
+    branches: [ci/unblocked-v4.35.0]
+    paths: [.github/workflows/async-socket-sanitizer-control.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  socket:
+    name: ASan and UBSan socket test (${{ matrix.arm }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arm: stock-v4.35.0
+            commit: eb6cafb7290e8bd5f2937522d8d804f58f02bafc
+          - arm: unblocked-v4.35.0
+            commit: 157b9c3bbb78662567088ce96aa43042227b1210
+    env:
+      LSAN_OPTIONS: max_leaks=10
+      CXX: c++
+      NIX_BUILD_SHELL: bash
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+        with:
+          summarize: false
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.commit }}
+          persist-credentials: false
+      - name: Configure and build
+        shell: nix develop -c bash -euxo pipefail {0}
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ matrix.commit }}"
+          cmp src/stdlib_flags.h stage0/src/stdlib_flags.h
+          cmake --preset sanitize -B build -DWFAIL=ON -DLEAN_HEADER_SNAPSHOTS=ON
+          make -C build stage1-configure -j"$(nproc)"
+          echo "LEAN_GITHASH=$(cat build/stage1/lake-githash)" >> "$GITHUB_ENV"
+          make -C build stage1 -j"$(nproc)"
+      - name: Run the original socket test
+        shell: nix develop -c bash -euxo pipefail {0}
+        run: |
+          git ls-files -z | xargs -0 chmod a-w
+          cat /proc/sys/net/ipv6/conf/lo/disable_ipv6
+          ctest --preset sanitize --test-dir build/stage1 \
+            -R '^elab/async_tcp_server_client[.]lean$' --no-tests=error \
+            --repeat until-fail:3 --output-on-failure --output-junit socket-results.xml
