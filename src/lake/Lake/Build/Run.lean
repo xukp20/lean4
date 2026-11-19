@@ -363,6 +363,11 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
+  releasedInterfaces? := ← id do
+    if cfg.oleanEarlyReleasePackages.isEmpty then
+      pure none
+    else
+      some <$> IO.mkRef {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?

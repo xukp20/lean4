@@ -42,6 +42,11 @@ public structure BuildConfig extends LogConfig where
   linter-tagged warnings), without touching dependencies.
   -/
   leanOptOverrides : Lean.NameMap Lean.LeanOptions := {}
+  /-- Packages whose module compilation jobs enable inductive unblocking. -/
+  /-- Packages whose module builds skip IDE reference indexes. -/
+  noIleanPackages : Lean.NameSet := {}
+  /-- Packages which publish completed module interfaces before generating IDE indexes and C. -/
+  oleanEarlyReleasePackages : Lean.NameSet := {}
   /--
   The miniumum OS version to target on MacOS.
 
@@ -87,6 +92,9 @@ public structure BuildContext extends BuildConfig, Context where
   leanTrace : BuildTrace
   leanIncludeDirs : Array (Option (FilePath × BuildTrace))
   registeredJobs : JobQueue
+  /-- Compiler readiness cells; all full jobs remain registered with the monitor. -/
+  releasedInterfaces? : Option (IO.Ref (Lean.NameMap (IO.Promise (JobResult Artifact)))) := none
+
   /--
   Input-to-output(s) map for hashes of the tracked package's artifacts.
   If `none`, tracking outputs is disabled for this build.

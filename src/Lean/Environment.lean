@@ -1526,6 +1526,14 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
   EnvExtension.envExtensionsRef.modify fun exts => exts.push (unsafe unsafeCast ext)
   pure ext
 
+/-- Register build outputs for cleanup on command-line interruption or process exit. -/
+@[extern "lean_register_output_cleanup"]
+opaque registerOutputCleanup (paths : Array String) : BaseIO UInt64
+
+/-- Disarm output cleanup, removing the registered paths first when `abort` is set. -/
+@[extern "lean_finish_output_cleanup"]
+opaque finishOutputCleanup (handle : UInt64) (abort : Bool := false) : BaseIO Unit
+
 private def mkInitialExtensionStates : IO (Array EnvExtensionState) := EnvExtension.mkInitialExtStates
 
 def mkEmptyEnvironment (trustLevel : UInt32 := 0) : IO Environment := do

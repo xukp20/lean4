@@ -120,6 +120,10 @@ def helpBuild :=
 USAGE:
   lake build [<targets>...] [-o <mappings>] [--package <name>]
 
+  --enable-optimization=no-ilean          skip IDE reference indexes in module jobs
+  --enable-optimization=olean-early-release  publish complete interfaces before IDE indexes and C
+  --optimization-scope=root   restrict enabled optimizations to the root package (default: workspace)
+
 A target is specified with a string of the form:
 
   [@[<package>]/][<target>|[+]<module>][:<facet>]

@@ -170,6 +170,8 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "      --plugin=file[=fn] load and initialize Lean shared library for registering linters etc."
   out.putStrLn    "      --load-dynlib=file load shared library to make its symbols available to the interpreter"
   out.putStrLn    "      --setup=file       JSON file with module setup data (supersedes the file's header)"
+  out.putStrLn    "      --enable-optimization=olean-early-release"
+  out.putStrLn    "                         enable signature-first inductive checking for this module job"
   out.putStrLn    "      --json             report Lean output (e.g., messages) as JSON (one per line)"
   out.putStrLn    "  -E, --error=kind       report Lean messages of kind as errors"
   out.putStrLn    "      --deps             just print dependencies of a Lean input"
@@ -225,6 +227,7 @@ def defaultNumThreads : UInt32 :=
 
 structure ShellOptions where
   leanOpts : Options := {}
+  oleanEarlyRelease : Bool := false
   forwardedArgs : Array String := #[]
   component : ShellComponent := .frontend
   printPrefix : Bool := false
@@ -429,6 +432,14 @@ def ShellOptions.process (opts : ShellOptions)
     Lean.loadDynlib arg
     let forwardedArgs := opts.forwardedArgs.push s!"-l{arg}"
     return {opts with forwardedArgs}
+  | 'K' => -- `--enable-optimization=name`
+    let name ← checkOptArg "enable-optimization" optArg?
+    match name with
+    | "olean-early-release" =>
+      return { opts with oleanEarlyRelease := true }
+    | _ =>
+      eprint s!"error: unknown optimization '{name}'\n"
+      throw 1
   | 'u' => -- `--setup=file`
     return {opts with setupFileName? := ← checkOptArg "u" optArg?}
   | 'E' => -- `-E, --error=kind`
@@ -550,32 +561,46 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
           throw e
     else
       pure `_stdin
-  let env? ← Elab.runFrontend contents opts.leanOpts fileName mainModuleName
-    opts.trustLevel opts.oleanFileName? opts.ileanFileName? opts.jsonOutput opts.errorOnKinds
-    #[] opts.printStats setup?
-    (incrSaveFileName? := opts.incrSaveFileName?)
-    (incrLoadFileName? := opts.incrLoadFileName?)
-    (incrHeaderSaveFileName? := opts.incrHeaderSaveFileName?)
-  if let some env := env? then
-    if opts.run then
-      return ← runMain env opts.leanOpts args
-    if let some c := opts.cFileName? then
-      writeFileAtomically c fun out => do
-        profileitIO "C code generation" opts.leanOpts do
-          let data ← Compiler.LCNF.emitC mainModuleName
-            |>.toIO' { fileName, fileMap := default } { env }
-          out.write data.toUTF8
-    if let some bc := opts.bcFileName? then
-      initLLVM
-      profileitIO "LLVM code generation" opts.leanOpts do
-        emitLLVM env mainModuleName bc
-  displayCumulativeProfilingTimes
-  if Internal.hasAddressSanitizer () then
-    return if env?.isSome then 0 else 1
-  else
-    -- When not using the address/leak sanitizer, we interrupt execution without garbage collecting.
-    -- This is useful when profiling improvements to Lean startup time.
-    IO.Process.exit <| if env?.isSome then 0 else 1
+  let cleanupHandle ← if opts.oleanEarlyRelease then
+    let mut paths := #[opts.ileanFileName?, opts.cFileName?, opts.bcFileName?].filterMap id
+    if let some olean := opts.oleanFileName? then
+      paths := paths ++ #[olean, olean.addExtension "server", olean.addExtension "private",
+        olean.withExtension "ir", olean.withExtension "ir.sig"]
+    registerOutputCleanup (paths.map (·.toString))
+  else pure 0
+  try
+    let env? ← Elab.runFrontend contents opts.leanOpts fileName mainModuleName
+      opts.trustLevel opts.oleanFileName? opts.ileanFileName? opts.jsonOutput opts.errorOnKinds
+      #[] opts.printStats setup?
+      (incrSaveFileName? := opts.incrSaveFileName?)
+      (incrLoadFileName? := opts.incrLoadFileName?)
+      (incrHeaderSaveFileName? := opts.incrHeaderSaveFileName?)
+      (oleanEarlyRelease := opts.oleanEarlyRelease)
+    if let some env := env? then
+      if opts.run then
+        if cleanupHandle != 0 then finishOutputCleanup cleanupHandle
+        return ← runMain env opts.leanOpts args
+      if let some c := opts.cFileName? then
+        writeFileAtomically c fun out => do
+          profileitIO "C code generation" opts.leanOpts do
+            let data ← Compiler.LCNF.emitC mainModuleName
+              |>.toIO' { fileName, fileMap := default } { env }
+            out.write data.toUTF8
+      if let some bc := opts.bcFileName? then
+        initLLVM
+        profileitIO "LLVM code generation" opts.leanOpts do
+          emitLLVM env mainModuleName bc
+    if cleanupHandle != 0 then finishOutputCleanup cleanupHandle (abort := env?.isNone)
+    displayCumulativeProfilingTimes
+    if Internal.hasAddressSanitizer () then
+      return if env?.isSome then 0 else 1
+    else
+      -- When not using the address/leak sanitizer, we interrupt execution without garbage collecting.
+      -- This is useful when profiling improvements to Lean startup time.
+      IO.Process.exit <| if env?.isSome then 0 else 1
+  catch e =>
+    if cleanupHandle != 0 then finishOutputCleanup cleanupHandle (abort := true)
+    throw e
 where
   writeFileAtomically (name : FilePath) (f : IO.FS.Handle → IO Unit) : IO Unit := do
     let pid ← Std.IO.Process.getId
