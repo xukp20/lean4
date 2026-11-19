@@ -363,6 +363,12 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
+  compilerBudget? := ← id do
+    if cfg.jobs?.isNone && cfg.maxProcs?.isNone then
+      return none
+    let threads := max 1 <| cfg.jobs?.getD (System.Platform.Internal.getAvailableParallelism ()).toNat
+    let maxProcs := max 1 <| min threads (cfg.maxProcs?.getD threads)
+    some <$> CompilerBudget.new threads maxProcs
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?

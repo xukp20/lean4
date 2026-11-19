@@ -1105,6 +1105,14 @@ def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
   let args := mod.weakLeanArgs ++ mod.leanArgs
+  let args := if let some budget := (← getBuildContext).compilerBudget? then
+    if args.any fun arg =>
+        arg.startsWith "-j" || arg == "--threads" || arg.startsWith "--threads=" then
+      args
+    else
+      args.push s!"-j{budget.threads}"
+  else
+    args
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← mkModuleSetup mod presetup
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
@@ -1127,6 +1135,20 @@ inductive ModuleFetchState
 | complete (arts : ModuleOutputArtifacts)
 | incomplete (savedTrace : SavedTrace) (ltar? : Option Artifact)
 
+private def runWithCompilerPermit [OptDataKind α] (budget : CompilerBudget) (act : JobM α) :
+    SpawnM (Job α) := .ofFn fun fetch pkg? stack store ctx trace => do
+  let permit ← budget.acquire
+  let task ← BaseIO.mapTask (t := permit) fun
+    | none => (withLoggedIO (error "compiler slot promise was dropped" : JobM α)).toFn fetch pkg? stack store ctx {trace}
+    | some () =>
+      try
+        if let some tk := ctx.cancelTk? then
+          if ← tk.isSet then return .error 0 {trace, canceled := true}
+        (withLoggedIO act).toFn fetch pkg? stack store ctx {trace}
+      finally
+        budget.release
+  return .ofTask task
+
 /--
 Recursively build a Lean module.
 Fetch its dependencies and then elaborate the Lean source file, producing
@@ -1140,12 +1162,25 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
   -/
   withRegisterJob mod.name.toString do
   let presetupJob ← mod.presetup.fetch
+  if let some budget := (← getBuildContext).compilerBudget? then
+    if !(← getNoBuild) then
+      return ← presetupJob.bindM fun presetup => do
+        setTrace presetup.trace
+        let decision ← fetchCore presetup
+        let trace ← getTrace
+        match decision with
+        | .inl arts => Job.sync do
+          setTrace trace
+          finish arts
+        | .inr build => runWithCompilerPermit budget do
+          finish (← build)
   presetupJob.mapM fun presetup => do
     setTrace presetup.trace
-    let arts ← fetchCore presetup
-    let arts ← adjustMTime arts mod.traceFile
-    return arts
+    match ← fetchCore presetup with
+    | .inl arts => finish arts
+    | .inr build => finish (← build)
 where
+  finish arts : JobM ModuleOutputArtifacts := adjustMTime arts mod.traceFile
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
     let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
@@ -1189,7 +1224,8 @@ where
           let ltar ← computeArtifact mod.ltarFile "ltar"
           return .complete {arts with ltar? := some ltar}
       return .complete arts
-  fetchCore (presetup : ModulePreSetup) : JobM ModuleOutputArtifacts := do
+  fetchCore (presetup : ModulePreSetup) :
+      JobM (ModuleOutputArtifacts ⊕ JobM ModuleOutputArtifacts) := do
     let depTrace ← getTrace
     have : GetMTime Module := ⟨(·.getMTime presetup.isModule presetup.postponeCompile)⟩
     have : CheckExists Module := ⟨(·.checkExists presetup.isModule presetup.postponeCompile)⟩
@@ -1197,52 +1233,47 @@ where
     if (← mod.pkg.isArtifactCacheWritable) then
       let restore ← mod.pkg.restoreAllArtifacts
       match (← fetchFromCache? presetup savedTrace restore) with
-      | .complete arts =>
-        return arts
+      | .complete arts => return .inl arts
       | .incomplete savedTrace ltar? =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
-        if status.isUpToDate then
-          unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
-            -- Restoring from the archive stamps the trace with the current input
-            -- hash, so only do it on a verified hash match. An mtime-only match
-            -- leaves the hash unconfirmed, so rebuild instead.
-            if status == .hashUpToDate then
-              mod.unpackLtar mod.ltarFile depTrace.hash
-            else
-              discard <| mod.buildLean presetup
-        else
-          discard <| mod.buildLean presetup
-        if status.isCacheable then
-          let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
-          let arts := {arts with ltar? := arts.ltar? <|> ltar?}
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
-          return arts
-        else
-          let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-          return {arts with ltar? := arts.ltar? <|> ltar?}
+        let finishCache := do
+          if status.isCacheable then
+            let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
+            let arts := {arts with ltar? := arts.ltar? <|> ltar?}
+            (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
+            return arts
+          else
+            let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+            return {arts with ltar? := arts.ltar? <|> ltar?}
+        if !status.isUpToDate then
+          return .inr (mod.buildLean presetup *> finishCache)
+        unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
+          -- Only a verified input hash permits restoring the previous archive.
+          if status == .hashUpToDate then
+            mod.unpackLtar mod.ltarFile depTrace.hash
+          else
+            return .inr (mod.buildLean presetup *> finishCache)
+        .inl <$> finishCache
     else
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
         unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
-          -- As above: restore on a hash match and rebuild on a mtime match.
           if status == .hashUpToDate then
             mod.unpackLtar mod.ltarFile depTrace.hash
           else
-            discard <| mod.buildLean presetup
-        mod.computeArtifacts presetup.isModule presetup.postponeCompile
+            return .inr (mod.buildLean presetup *> mod.computeArtifacts presetup.isModule presetup.postponeCompile)
+        .inl <$> mod.computeArtifacts presetup.isModule presetup.postponeCompile
+      else if (← mod.pkg.isArtifactCacheReadable) then
+        match (← fetchFromCache? presetup savedTrace true) with
+        | .complete arts => return .inl arts
+        | .incomplete savedTrace ltar? =>
+          if (← savedTrace.replayIfUpToDate (oldTrace := presetup.srcMTime) mod depTrace) then
+            let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+            return .inl {arts with ltar? := arts.ltar? <|> ltar?}
+          else
+            return .inr (mod.buildLean presetup)
       else
-        if (← mod.pkg.isArtifactCacheReadable) then
-          match (← fetchFromCache? presetup savedTrace true) with
-          | .complete arts =>
-              return arts
-          | .incomplete savedTrace ltar? =>
-            if (← savedTrace.replayIfUpToDate (oldTrace := presetup.srcMTime) mod depTrace) then
-              let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-              return {arts with ltar? := arts.ltar? <|> ltar?}
-            else
-              mod.buildLean presetup
-        else
-          mod.buildLean presetup
+        return .inr (mod.buildLean presetup)
 
 /-- The `ModuleFacetConfig` for the builtin `elabArtsFacet`. -/
 public def Module.elabArtsFacetConfig : ModuleFacetConfig elabArtsFacet :=

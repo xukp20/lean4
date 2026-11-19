@@ -63,6 +63,8 @@ public structure LakeOptions where
   allowEmpty : Bool := false
   noBuild : Bool := false
   failFast : Bool := false
+  jobs? : Option Nat := none
+  maxProcs? : Option Nat := none
   noCache : Option Bool := none
   failLv : LogLevel := .error
   outLv? : Option LogLevel := .none
@@ -156,6 +158,8 @@ def LakeOptions.mkBuildConfig
   trustHash := opts.trustHash
   noBuild := opts.noBuild
   failFast := opts.failFast
+  jobs? := opts.jobs?
+  maxProcs? := opts.maxProcs?
   verbosity := opts.verbosity
   failLv := opts.failLv
   outLv := opts.outLv
@@ -310,6 +314,14 @@ def lakeLongOption : (opt : String) → CliM PUnit
 | "--allow-empty" => modifyThe LakeOptions ({· with allowEmpty := true})
 | "--no-build"    => modifyThe LakeOptions ({· with noBuild := true})
 | "--fail-fast"   => modifyThe LakeOptions ({· with failFast := true})
+| "--jobs" => do
+  let jobs ← takeOptArg' "--jobs" "positive CPU budget" fun arg =>
+    arg.toNat?.filter (· > 0)
+  modifyThe LakeOptions ({· with jobs? := some jobs})
+| "--max-procs" => do
+  let maxProcs ← takeOptArg' "--max-procs" "positive compiler process limit" fun arg =>
+    arg.toNat?.filter (· > 0)
+  modifyThe LakeOptions ({· with maxProcs? := some maxProcs})
 | "--no-cache"    => modifyThe LakeOptions ({· with noCache := true})
 | "--try-cache"   => modifyThe LakeOptions ({· with noCache := false})
 | "--rehash"      => modifyThe LakeOptions ({· with trustHash := false})
@@ -976,6 +988,11 @@ protected def init : CliM PUnit := do
 
 protected def build : CliM PUnit := do
   processOptions lakeOption
+  if (← getThe LakeOptions).maxProcs?.isNone then
+    if let some raw ← IO.getEnv "LAKE_MAX_PROCS" then
+      let some limit := raw.toNat?.filter (· > 0)
+        | error "LAKE_MAX_PROCS must be a positive compiler process limit"
+      modifyThe LakeOptions ({· with maxProcs? := some limit})
   let opts ← getThe LakeOptions
   let config ← mkLoadConfig opts
   let ws ← loadWorkspace config

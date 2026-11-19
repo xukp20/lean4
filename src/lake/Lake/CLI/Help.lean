@@ -61,6 +61,9 @@ BASIC OPTIONS:
   --allow-empty         accept bare builds with no default targets configured
   --no-build            exit immediately if a build target is not up-to-date
   --fail-fast           stop scheduling new build jobs after the first required failure
+  --jobs=<P>            use P threads per Lean elaboration process
+  --max-procs=<K>       cap concurrent Lean elaboration processes at K and at the CPU budget
+                        defaults to LAKE_MAX_PROCS when set
   --no-cache            build packages locally; do not download build caches
   --try-cache           attempt to download build caches for supported packages
   --json, -J            output JSON-formatted results (in `lake query`)
