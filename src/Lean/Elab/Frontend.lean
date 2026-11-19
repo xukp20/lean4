@@ -266,6 +266,34 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
+private def inductiveChecksPassed (checks : Array InductiveCheckObligation) : Bool :=
+  checks.all (·.status == .passed)
+
+private def formalPublicationAllowed (hasErrors : Bool) (checks : Array InductiveCheckObligation) :
+    Bool :=
+  !hasErrors && inductiveChecksPassed checks
+
+private def reportUnpassedInductiveChecks (checks : Array InductiveCheckObligation)
+    (fileName : String) (opts : Options) (jsonOutput : Bool) : IO Unit := do
+  let mut msgs : MessageLog := .empty
+  for check in checks do
+    let reason ← match check.status with
+      | .passed => continue
+      | .pending => pure "is still pending"
+      | .failed => pure "failed"
+      | .cancelled => pure "was interrupted"
+    msgs := msgs.add {
+      fileName
+      pos := ⟨1, 0⟩
+      severity := .error
+      data := m!"complete kernel check for inductive '{check.name}' {reason}"
+    }
+  let report : Language.SnapshotTree := .mk {
+    desc := "inductive kernel checks"
+    diagnostics := ← Language.Snapshot.Diagnostics.ofMessageLog msgs
+  } #[]
+  discard <| report.runAndReport opts jsonOutput
+
 def runFrontend
     (input : String)
     (opts : Options)
@@ -365,24 +393,31 @@ def runFrontend
     IO.FS.writeFile (incrFile.addExtension "deps") (toJson moduleArts).compress
     Runtime.forget compactor
 
-  -- save full incremental snapshot for next invocation
-  if let some incrFile := incrSaveFileName? then
-    -- Per-command `CancelToken`s are left unresolved on success; their internal `Promise`
-    -- tasks would block the compactor's `lean_task_get`. Fire them all before save.
-    -- `truncateToHeader` discards everything below the header so this isn't needed for the
-    -- header-only save below.
-    resolveCancelTokensForSave (Language.toSnapshotTree snap)
-    saveSnap incrFile snap
+  let inductiveChecks ← getInductiveChecks env
+  if inductiveChecksPassed inductiveChecks then
+    if incrSaveFileName?.isSome || incrHeaderSaveFileName?.isSome then
+      discardCompletedInductiveChecks env
 
-  -- save header-only snapshot (skips elaborated command bodies)
-  if let some incrFile := incrHeaderSaveFileName? then
-    saveSnap incrFile (Language.Lean.truncateToHeader snap)
+    -- save full incremental snapshot for next invocation
+    if let some incrFile := incrSaveFileName? then
+      -- Per-command `CancelToken`s are left unresolved on success; their internal `Promise`
+      -- tasks would block the compactor's `lean_task_get`. Fire them all before save.
+      -- `truncateToHeader` discards everything below the header so this isn't needed for the
+      -- header-only save below.
+      resolveCancelTokensForSave (Language.toSnapshotTree snap)
+      saveSnap incrFile snap
 
-  -- stats should be displayed even if there are (non-import) errors
-  if printStats then
-    env.displayStats
+    -- save header-only snapshot (skips elaborated command bodies)
+    if let some incrFile := incrHeaderSaveFileName? then
+      saveSnap incrFile (Language.Lean.truncateToHeader snap)
 
-  if hasErrors then
+    -- stats should be displayed even if there are (non-import) errors
+    if printStats then
+      env.displayStats
+
+  if !formalPublicationAllowed hasErrors inductiveChecks then
+    unless hasErrors do
+      reportUnpassedInductiveChecks inductiveChecks fileName opts jsonOutput
     return none
 
   if let some oleanFileName := oleanFileName? then

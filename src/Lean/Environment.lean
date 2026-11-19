@@ -12,6 +12,7 @@ public import Init.System.Promise
 public import Init.System.CancelToken
 public import Lean.Data.NameTrie
 public import Lean.Setup
+public import Lean.ModuleJobConfig
 public import Lean.LocalContext
 public import Lean.Util.Path
 public import Lean.Util.FindExpr
@@ -1312,6 +1313,11 @@ not block.
 -/
 def containsOnBranch (env : Environment) (n : Name) : Bool :=
   (env.asyncConsts.find? n |>.isSome) || (env.base.get env).constants.contains n
+/-- Checks whether a constant has direct asynchronous entries in both visibility scopes, without
+consulting the kernel environment or waiting for another branch. -/
+def containsAsyncOnBranch (env : Environment) (n : Name) : Bool :=
+  (env.asyncConstsMap.private.find? n).isSome && (env.asyncConstsMap.public.find? n).isSome
+
 
 /--
 Returns whether `realizeConst forConst` callbacks can access `c` in the private scope, i.e. whether
@@ -1842,6 +1848,133 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
   -- safety: `EnvExtensionState` is opaque, so we can upcast to it
   EnvExtension.envExtensionsRef.modify fun exts => exts.push (unsafe unsafeCast ext)
   pure ext
+
+namespace Environment
+
+/-- The accumulated signature constants of one immutable environment branch. -/
+private builtin_initialize signatureConstsExt : EnvExtension (Option (Name × ConstMap)) ←
+  registerEnvExtension (pure none) (asyncMode := .local)
+
+private def cacheSignatureConsts (env : Environment) (signature : Kernel.Environment) : Environment :=
+  signatureConstsExt.setState env (some (env.mainModule, signature.constants))
+
+private def prependSignatureDeps (info : ConstantInfo) (pending : List Name) : List Name :=
+  let pending := info.type.foldConsts pending (· :: ·)
+  let pending := if let some value := info.value? (allowOpaque := true) then
+    value.foldConsts pending (· :: ·)
+  else pending
+  match info with
+  | .inductInfo val =>
+    let pending := val.all.foldl (fun acc n => n :: mkRecName n :: acc) (val.ctors ++ pending)
+    let recName := mkRecName (val.all.headD val.name)
+    (List.range val.numNested).foldl (fun acc i => recName.appendIndexAfter (i + 1) :: acc) pending
+  | .ctorInfo val => val.induct :: pending
+  | .recInfo val => val.rules.foldl
+      (fun acc rule => rule.rhs.foldConsts (rule.ctor :: acc) (· :: ·)) (val.all ++ pending)
+  | _ => pending
+
+/-- Extend a signature environment with the requested, already available dependencies. -/
+partial def toKernelSignature (env : Environment) (roots : List Name) (newNames : NameSet := {}) :
+    BaseIO (Option (Environment × Kernel.Environment)) := do
+  let base := env.base.private
+  let signature := match signatureConstsExt.getState env with
+    | some (mainModule, constants) =>
+      if mainModule == env.mainModule then { base with constants } else base
+    | none => base
+  let some signature ← collect (env.setExporting false) roots signature | return none
+  return some (cacheSignatureConsts env signature, signature)
+where
+  collect (env : Environment) (pending : List Name) (signature : Kernel.Environment) :
+      BaseIO (Option Kernel.Environment) := do
+    let n :: rest := pending | return some signature
+    if signature.constants.contains n || newNames.contains n then
+      return ← collect env rest signature
+    -- Only direct branch entries can be queried without waiting for nested elaboration or realizations.
+    unless env.containsOnBranch n do return none
+    let some info := env.findAsync? n (skipRealize := true) | return none
+    let cinfo ← if info.kind == .thm then
+      if ← IO.hasFinished info.sig then
+        pure <| ConstantInfo.axiomInfo { info.toConstantVal with isUnsafe := false }
+      else return none
+    else if ← IO.hasFinished info.constInfo then
+      pure info.toConstantInfo
+    else return none
+    -- Add before traversing the dependencies, since inductive families and recursors are cyclic.
+    collect env (prependSignatureDeps cinfo rest) (signature.add cinfo)
+
+private def hasInductiveNameCollision (env : Environment) (n : Name) : Bool :=
+  env.base.private.constants.contains n ||
+    (env.asyncConstsMap.private.normalizedTrie.find? (privateToUserName n)).isSome
+
+/--
+Checks an inductive against local signatures without forcing `checked`, publishes its
+constants, and leaves a promise for an ordered check in the complete environment.
+The caller must perform the complete check on `asyncEnv` and call `commitChecked` even on failure.
+-/
+def addInductiveSignature (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize)
+    (decl : Declaration) (cancelTk? : Option IO.CancelToken) :
+    BaseIO (Except Kernel.Exception PromiseCheckedResult) := do
+  if ← IO.hasFinished env.checked then
+    return .error <| .other "kernel environment is ready"
+  let names := decl.getNames
+  if let some n := names.find? (hasInductiveNameCollision env) then
+    return .error <| .alreadyDeclared env.base.private n
+  if let some ctx := env.asyncCtx? then
+    if let some n := decl.getTopLevelNames.find? (!ctx.mayContain ·) then
+      return .error <| .other s!"cannot add declaration {n} to environment as it is restricted to the \
+        prefix {ctx.declPrefix}"
+  let roots := Id.run <| decl.foldExprM (fun acc e => pure (e.foldConsts acc (· :: ·))) []
+  let some (env, signatureEnv) ← env.toKernelSignature roots (.ofList names) |
+    return .error <| .other "signature dependencies are unavailable"
+  let signatureResult := signatureEnv.addDeclCore maxHeartbeats maxRecDepth decl cancelTk?
+  match signatureResult with
+  | .error ex => return .error ex
+  | .ok checkedSignature =>
+    let mut names := names
+    if let .inductDecl _ _ (indType :: _) _ := decl then
+      let some (.inductInfo info) := checkedSignature.find? indType.name
+        | return .error <| .other "signature kernel did not return an inductive type"
+      -- The kernel names all auxiliary recursors after the first type in the mutual group.
+      let auxNames := (List.range info.numNested).map fun i =>
+        indType.name ++ `rec |>.appendIndexAfter (i + 1)
+      for n in auxNames do
+        if hasInductiveNameCollision env n then
+          return .error <| .alreadyDeclared env.base.private n
+        unless (checkedSignature.find? n).any (fun c => c matches .recInfo _) do
+          return .error <| .other s!"signature kernel did not return auxiliary recursor {n}"
+      names := names ++ auxNames
+    let mut mainEnv := env
+    for n in names do
+      let info := (checkedSignature.find? n).get!
+      mainEnv := { mainEnv with asyncConstsMap := mainEnv.asyncConstsMap.map (·.add {
+        constInfo := .ofConstantInfo info
+        exts? := none
+        aconstsImpl := .pure <| .mk (α := AsyncConsts) default
+      }) }
+    mainEnv := cacheSignatureConsts mainEnv checkedSignature
+    let res ← env.promiseChecked
+    return .ok { res with
+      mainEnv := { mainEnv with checked := res.mainEnv.checked }
+      -- The declaration may contain multiple inductive names, so a single-name async prefix is
+      -- insufficient. The original branch restriction was checked before the signature check.
+      asyncEnv := env.enterAsync .anonymous
+    }
+
+end Environment
+
+private builtin_initialize moduleJobConfigExt : EnvExtension ModuleJobConfig ←
+  registerEnvExtension (asyncMode := .local) (pure {})
+
+def Environment.moduleJobConfig (env : Environment) : ModuleJobConfig :=
+  moduleJobConfigExt.getState env
+
+def Environment.setModuleJobConfig (env : Environment) (config : ModuleJobConfig) : Environment :=
+  moduleJobConfigExt.setState env config
+
+register_builtin_option experimental.inductiveUnblock : Bool := {
+  defValue := false
+  descr := "check inductive signatures before ordered complete kernel checking"
+}
 
 private def mkInitialExtensionStates : IO (Array EnvExtensionState) := EnvExtension.mkInitialExtStates
 

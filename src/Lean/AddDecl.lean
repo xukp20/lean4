@@ -97,6 +97,55 @@ def warnIfUsesSorry (decl : Declaration) : CoreM Unit := do
 
 builtin_initialize
   registerTraceClass `addDecl
+  registerTraceClass `addDecl.inductive
+
+/-- Completion status of a complete kernel check whose inductive signature was published early. -/
+inductive InductiveCheckStatus where
+  | pending
+  | passed
+  | failed
+  | cancelled
+  deriving Inhabited, BEq
+
+structure InductiveCheckObligation where
+  name : Name
+  status : InductiveCheckStatus
+  deriving Inhabited
+
+-- All branches share this reference. Local environment extensions are not exported.
+private builtin_initialize inductiveChecksExt :
+    EnvExtension (Option (IO.Ref (Array InductiveCheckObligation))) ←
+  registerEnvExtension (some <$> IO.mkRef #[]) (asyncMode := .local)
+
+def getInductiveChecks (env : Environment) : BaseIO (Array InductiveCheckObligation) :=
+  match inductiveChecksExt.getState env with
+  | some checks => checks.get
+  | none => pure #[]
+
+/-- A successful incremental checkpoint needs no completed obligations from this invocation. -/
+def discardCompletedInductiveChecks (env : Environment) : BaseIO Unit :=
+  (inductiveChecksExt.getState env).forM fun checks =>
+    checks.modify fun obligations =>
+      if obligations.all (·.status == .passed) then #[] else obligations
+
+private def registerInductiveCheck (checks : IO.Ref (Array InductiveCheckObligation))
+    (name : Name) : BaseIO Nat :=
+  checks.modifyGet fun obligations => (obligations.size, obligations.push { name, status := .pending })
+
+private def checkInductiveObligation (checks : IO.Ref (Array InductiveCheckObligation))
+    (idx : Nat) (name : Name) (doAdd : CoreM Unit) : CoreM Unit := fun ctx state => do
+  -- Observe the original EIO outcome on the same state reference. CoreM.catch skips interrupts.
+  match ← (doAdd ctx state).toBaseIO with
+  | .ok () =>
+    checks.modify fun obligations => obligations.modify idx ({ · with status := .passed })
+  | .error ex =>
+    let status := if ex.isInterrupt then InductiveCheckStatus.cancelled else .failed
+    checks.modify fun obligations => obligations.modify idx ({ · with status })
+    let message := if ex.isInterrupt then
+      m!"complete kernel check for inductive '{name}' was interrupted"
+    else
+      ex.toMessageData
+    (logError message : CoreM Unit) ctx state
 
 /--
 Records that `declName` is about to be added as a declaration of kind `kind` that is exported as a
@@ -136,6 +185,48 @@ private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :
         exportedInfo? := some <| .axiomInfo { op with }
       pure (op.name, .opaqueInfo op, .opaque)
     | .axiomDecl ax => pure (ax.name, .axiomInfo ax, .axiom)
+    | .inductDecl .. =>
+      unless ((← getEnv).moduleJobConfig.inductiveUnblock || experimental.inductiveUnblock.get (← getOptions)) do
+        trace[addDecl] "no matching async adding rules, adding synchronously"
+        return (← doAdd)
+      if Elab.async.get (← getOptions) && !debug.skipKernelTC.get (← getOptions) then
+        let env ← getEnv
+        let some checks := inductiveChecksExt.getState env | return (← doAdd)
+        match ← env.addInductiveSignature (Core.getMaxHeartbeats (← getOptions)).toUSize
+            (maxRecDepth.get (← getOptions)).toUSize decl (← read).cancelTk? with
+        | .ok async =>
+          let name := decl.getTopLevelNames.head!
+          let obligation ← registerInductiveCheck checks name
+          trace[addDecl.inductive] "inductive signature checked; scheduling complete check"
+          setEnv async.mainEnv
+          let cancelTk ← IO.CancelToken.new
+          let ngen ← getNGen
+          let declNGen ← getDeclNGen
+          -- The kernel checks fixed declaration names. Give this task a separate name supply
+          -- so scheduling it does not advance either generator of the elaborating branch.
+          let checkPrefix := Name.num (.str ngen.namePrefix "_inductiveCheck") ngen.idx ++
+            name
+          let checkAct ←
+            try
+              setNGen { namePrefix := checkPrefix }
+              setDeclNGen { namePrefix := checkPrefix }
+              Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun _ => do
+                setEnv async.asyncEnv
+                try
+                  checkInductiveObligation checks obligation name doAdd
+                finally
+                  async.commitChecked (← getEnv)
+            finally
+              setNGen ngen
+              setDeclNGen declNGen
+          let t ← BaseIO.mapTask checkAct env.checked
+          Core.logSnapshotTask {
+            stx? := none, reportingRange := .skip, task := t, cancelTk? := cancelTk
+          }
+          return
+        | .error _ =>
+          trace[addDecl.inductive] "inductive signature check failed; adding synchronously"
+      return (← doAdd)
     | _ =>
       trace[addDecl] "no matching async adding rules, adding synchronously"
       return (← doAdd)
