@@ -234,7 +234,7 @@ end Ilean
 def getModuleContainingDecl? (env : Environment) (declName : Name) : Option Name := do
   let some modIdx := env.getModuleIdxFor? declName
     | env.header.mainModule
-  env.allImportedModuleNames[modIdx]?
+  env.header.modules[modIdx]?.map (·.module)
 
 /--
 Determines the `RefIdent` for the `Info` `i` of an identifier in `module` and

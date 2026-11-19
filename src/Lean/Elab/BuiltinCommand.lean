@@ -750,9 +750,10 @@ def elabDeprecatedModule : CommandElab
 def elabShowDeprecatedModules : CommandElab := fun _ => do
   let env ← getEnv
   let mut parts : Array String := #["Deprecated modules\n"]
-  for h : idx in [:env.header.moduleNames.size] do
+  let modNames := env.header.moduleNames
+  for h : idx in [:modNames.size] do
     if let some entry := env.getDeprecatedModuleByIdx? idx then
-      let modName := env.header.moduleNames[idx]
+      let modName := modNames[idx]
       let msg := match entry.message? with
         | some str => s!"message '{str}'"
         | none => "no message"

@@ -134,8 +134,9 @@ Each deferred check is paired with the module it was recorded in.
 private def collect (env : Environment) (inPackage : Name → Bool) :
     Array (Name × DeferredCheck) := Id.run do
   let mut out := #[]
-  for i in [0:env.header.moduleNames.size] do
-    let mod := env.header.moduleNames[i]!
+  let modNames := env.header.moduleNames
+  for i in [0:modNames.size] do
+    let mod := modNames[i]!
     if inPackage mod then
       out := out ++ (deferredCheckExt.getModuleEntries env i).map (mod, ·)
   let mod := env.mainModule

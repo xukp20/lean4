@@ -910,7 +910,7 @@ def createImportedEnvironmentSeq (cctx : Core.Context) (ngen : NameGenerator) (e
       go (← ImportData.new) cacheRef {} start stop
     where go d cacheRef (tree : PreDiscrTree α) (start stop : Nat) : BaseIO _ := do
             if start < stop then
-              let mname := env.header.moduleNames[start]!
+              let mname := env.header.modules[start]!.module
               let mdata := env.header.moduleData[start]!
               let tree ← loadImportedModule cctx env act d cacheRef tree mname mdata
               go d cacheRef tree (start+1) stop

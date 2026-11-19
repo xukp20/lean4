@@ -193,7 +193,7 @@ def findModuleOf? [Monad m] [MonadEnv m] [MonadError m] (declName : Name) : m (O
   discard <| getConstInfo declName -- ensure declaration exists
   match (← getEnv).getModuleIdxFor? declName with
   | none        => return none
-  | some modIdx => return some ((← getEnv).allImportedModuleNames[modIdx.toNat]!)
+  | some modIdx => return some ((← getEnv).header.modules[modIdx.toNat]!.module)
 
 /--
 Returns `true` if the recursor of the inductive type `declName` eliminates into an arbitrary `Sort`,
