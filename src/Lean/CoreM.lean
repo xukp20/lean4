@@ -740,6 +740,13 @@ builtin_initialize compileDeclsRef : IO.Ref (Array Name → Options → CoreM Un
 private def compileDeclsImpl (declNames : Array Name) : CoreM Unit := do
   (← compileDeclsRef.get) declNames {}
 
+@[extern "lbt_core_enabled"] private opaque coreEnabled : BaseIO Bool
+@[extern "lbt_core_current_scope"] private opaque coreScope : BaseIO UInt64
+@[extern "lbt_core_work_begin"] private opaque coreWorkBegin
+    (kind : UInt32) (origin : UInt64) (label : @& String) : BaseIO UInt64
+@[extern "lbt_core_scope_end"] private opaque coreWorkEnd
+    (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+
 -- `ref?` is used for error reporting if available
 def compileDecls (decls : Array Name) (logErrors := true) : CoreM Unit := do
   let env ← getEnv
@@ -751,12 +758,21 @@ def compileDecls (decls : Array Name) (logErrors := true) : CoreM Unit := do
   let res ← env.promiseChecked
   setEnv res.mainEnv
   let cancelTk ← IO.CancelToken.new
+  let origin ← coreScope
   let checkAct ← Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun _ => do
-    setEnv res.asyncEnv
+    let id ← if (← coreEnabled) then
+        coreWorkBegin 21 origin (String.intercalate "\n" (decls.toList.map Name.toString))
+      else pure 0
     try
-      doCompile
-    finally
-      res.commitChecked (← getEnv)
+      setEnv res.asyncEnv
+      try
+        doCompile
+      finally
+        res.commitChecked (← getEnv)
+      if id != 0 then coreWorkEnd 21 id 1
+    catch e =>
+      if id != 0 then coreWorkEnd 21 id 2
+      throw e
   let t ← BaseIO.mapTask checkAct env.checked
   -- Do not display reporting range; most uses of `addDecl` are for registering auxiliary decls
   -- users should not worry about and other callers can add a separate task with ranges

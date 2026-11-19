@@ -19,6 +19,16 @@ public section
 
 namespace Lean
 
+@[extern "lbt_core_enabled"] private opaque coreEnabled : BaseIO Bool
+@[extern "lbt_core_current_scope"] private opaque coreScope : BaseIO UInt64
+@[extern "lbt_core_work_begin"] private opaque coreWorkBegin
+    (kind : UInt32) (origin : UInt64) (label : @& String) : BaseIO UInt64
+@[extern "lbt_core_scope_end"] private opaque coreWorkEnd
+    (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+
+@[extern "lbt_core_kernel_checked_task"] private opaque coreCheckedTask
+    (id : UInt64) (task : @& Task Kernel.Environment) : BaseIO Unit
+
 /-- Adds given declaration to the environment, respecting `debug.skipKernelTC`. -/
 def Kernel.Environment.addDecl (env : Environment) (opts : Options) (decl : Declaration)
     (cancelTk? : Option IO.CancelToken := none) : Except Exception Environment :=
@@ -150,6 +160,7 @@ private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :
       trace[addDecl] "no matching exporting rules, exporting as is"
       exportedInfo? := some info
 
+  let origin ← coreScope
   let env ← getEnv
   -- no environment extension changes to report after kernel checking; ensures we do not
   -- accidentally wait for this snapshot when querying extension states
@@ -168,7 +179,18 @@ private def addDeclCore (decl : Declaration) (forceExpose : Bool) : CoreM Unit :
 
   if Elab.async.get (← getOptions) then
     let cancelTk ← IO.CancelToken.new
-    let checkAct ← Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun _ => doAddAndCommit
+    let checkAct ← Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun _ => do
+      if !(← coreEnabled) then
+        doAddAndCommit
+      else
+        let id ← coreWorkBegin 8 origin name.toString
+        if id != 0 then coreCheckedTask id async.mainEnv.checked
+        try
+          doAddAndCommit
+          coreWorkEnd 8 id 1
+        catch e =>
+          coreWorkEnd 8 id 2
+          throw e
     let t ← BaseIO.mapTask checkAct env.checked
     -- Do not display reporting range; most uses of `addDecl` are for registering auxiliary decls
     -- users should not worry about and other callers can add a separate task with ranges
@@ -185,9 +207,18 @@ where
       withTraceNode `Kernel (fun _ => return m!"typechecking declarations {decl.getTopLevelNames}") do
         warnIfUsesSorry decl
         try
-          let env ← (← getEnv).addDeclAux (← getOptions) decl (← read).cancelTk?
-            |> ofExceptKernelException
-          setEnv env
+          let env ← getEnv
+          let opts ← getOptions
+          let tk := (← read).cancelTk?
+          if !(← coreEnabled) || debug.skipKernelTC.get opts then
+            setEnv (← ofExceptKernelException (env.addDeclAux opts decl tk))
+          else
+            let origin ← coreScope
+            let label := String.intercalate "\n" (decl.getTopLevelNames.map Name.toString)
+            let id ← coreWorkBegin 9 origin label
+            let result ← IO.lazyPure fun _ => env.addDeclAux opts decl tk
+            coreWorkEnd 9 id (if result.isOk then 1 else 2)
+            setEnv (← ofExceptKernelException result)
         catch ex =>
           -- avoid follow-up errors by (trying to) add broken decl as axiom
           addAsAxiom

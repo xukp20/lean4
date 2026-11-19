@@ -18,6 +18,8 @@ extern "C" __thread lean_runtime_tls lean_g_tls = {};
 #endif
 #endif
 
+extern "C" void lbt_core_adjust_heartbeats(uint64_t before, uint64_t after);
+
 namespace lean {
 
 void initialize_alloc() {
@@ -31,6 +33,7 @@ void finalize_alloc() {
 }
 
 void set_heartbeats(uint64_t count) {
+    lbt_core_adjust_heartbeats(lean_g_tls.heartbeat, count);
     lean_g_tls.heartbeat = count;
 }
 

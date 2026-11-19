@@ -9,6 +9,17 @@ public import Lean.Elab.Deriving.Basic
 public import Lean.Elab.PreDefinition.Main
 import all Lean.Elab.ErrorUtils
 public section
+namespace Lean.BuildTraceCore
+@[extern "lbt_core_current_command"]
+opaque currentCommand : BaseIO UInt64
+@[extern "lbt_core_proof_begin"]
+opaque proofBegin (command lo hi : UInt64) : BaseIO UInt64
+@[extern "lbt_core_scope_end"]
+opaque proofEnd (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+@[extern "lbt_core_kept_vars"]
+opaque keptVars (active kept : UInt64) : BaseIO Unit
+end Lean.BuildTraceCore
+
 namespace Lean.Elab
 open Lean.Parser.Term
 
@@ -459,6 +470,7 @@ private def withHeaderSecVars {α} (vars : Array Expr) (sc : Command.Scope) (hea
     revSectionFVars := revSectionFVars.insert var.fvarId! uid
   let (_, used) ← collectUsed revSectionFVars |>.run {}
   let (lctx, localInsts, vars) ← removeUnused vars used
+  BuildTraceCore.keptVars sc.varDecls.size.toUInt64 vars.size.toUInt64
   withLCtx lctx localInsts <| k vars
 where
   collectUsed revSectionFVars : StateRefT CollectFVars.State MetaM Unit := do
@@ -1312,6 +1324,7 @@ this warning can be disabled with `set_option warn.classDefReducibility false`."
 
     -- now start new thread for body elaboration, then nested thread for kernel checking
     let cancelTk ← IO.CancelToken.new
+    let traceCommand ← Lean.BuildTraceCore.currentCommand
     let act ←
       -- NOTE: We must set the decl name before going async to ensure that the `auxDeclNGen` is
       -- forked correctly.
@@ -1319,18 +1332,29 @@ this warning can be disabled with `set_option warn.classDefReducibility false`."
       withDeclName header.declName do
       wrapAsyncAsSnapshot (desc := s!"elaborating proof of {declId.declName}")
         (cancelTk? := cancelTk) fun _ => do profileitM Exception "elaboration" (← getOptions) do
-      setEnv async.asyncEnv
-      try
-        finishElab #[header]
-      finally
-        reportDiag
-        -- must introduce node to fill `infoHole` with multiple info trees
-        let info := .ofCustomInfo { stx := header.value, value := .mk (α := AsyncBodyInfo) {} }
-        let ctx ← CommandContextInfo.save
-        infoPromise.resolve <| .context (.commandCtx ctx) <| .node info (← getInfoTrees)
-      async.commitConst (← getEnv)
-      processDeriving #[header]
-      async.commitCheckEnv (← getEnv)
+      let originalBody : TermElabM Unit := do
+        setEnv async.asyncEnv
+        try
+          finishElab #[header]
+        finally
+          reportDiag
+          -- must introduce node to fill `infoHole` with multiple info trees
+          let info := .ofCustomInfo { stx := header.value, value := .mk (α := AsyncBodyInfo) {} }
+          let ctx ← CommandContextInfo.save
+          infoPromise.resolve <| .context (.commandCtx ctx) <| .node info (← getInfoTrees)
+        async.commitConst (← getEnv)
+        processDeriving #[header]
+        async.commitCheckEnv (← getEnv)
+      if traceCommand == 0 then originalBody else
+        let traceId ← Lean.BuildTraceCore.proofBegin traceCommand
+          (view.ref.getPos?.map (·.byteIdx.toUInt64) |>.getD 18446744073709551615)
+          (view.ref.getTailPos?.map (·.byteIdx.toUInt64) |>.getD 18446744073709551615)
+        try
+          originalBody
+          if traceId != 0 then Lean.BuildTraceCore.proofEnd 2 traceId 1
+        catch error =>
+          if traceId != 0 then Lean.BuildTraceCore.proofEnd 2 traceId 2
+          throw error
     Core.logSnapshotTask { stx? := none, task := (← BaseIO.asTask (act ())), cancelTk? := cancelTk }
     -- Also add explicit snapshot task for showing progress of kernel checking; `addDecl` does not
     -- do this by default

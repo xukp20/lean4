@@ -2300,6 +2300,31 @@ where
       p := body
     p.isProp
 
+namespace BuildTraceCore
+@[extern "lbt_core_enabled"] private opaque coreEnabled : BaseIO Bool
+@[extern "lbt_core_current_scope"] private opaque coreScope : BaseIO UInt64
+@[extern "lbt_core_work_begin"] private opaque coreWorkBegin
+    (kind : UInt32) (origin : UInt64) (label : @& String) : BaseIO UInt64
+@[extern "lbt_core_scope_end"] private opaque coreWorkEnd
+    (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+
+@[extern "lbt_core_span_begin"]
+opaque spanBegin (kind : UInt32) : BaseIO UInt64
+@[extern "lbt_core_span_end"]
+opaque spanEnd (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+
+@[noinline] def observeImport (kind : UInt32) (act : IO α) : IO α := do
+  let id ← spanBegin kind
+  if id == 0 then return ← act
+  try
+    let result ← act
+    spanEnd kind id 1
+    return result
+  catch error =>
+    spanEnd kind id 2
+    throw error
+end BuildTraceCore
+
 /--
 Constructs environment from `importModulesCore` results.
 
@@ -2310,6 +2335,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     -- If true, prefer loading `.ir.sig` over `.ir` unless `import all`ed; used by leanir
     (loadIRSig := false) :
     IO Environment := do
+  let traceFinalize ← BuildTraceCore.spanBegin 4
   let modules := s.moduleNames.filterMap (s.moduleNameMap[·]?)
   let moduleData ← modules.mapM fun mod => do
     let some data := mod.mainModule? |
@@ -2387,6 +2413,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     importRealizationCtx? := none
     serverBaseExts := (← setImportedEntries privateBase.extensions serverData)
   }
+  if traceFinalize != 0 then BuildTraceCore.spanEnd 4 traceFinalize 1
   if leakEnv then
     /- Mark persistent a first time before `finalizePersistentExtensions`, which
        avoids costly MT markings when e.g. an interpreter closure (which
@@ -2400,16 +2427,16 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        `markPersistent` multiple times like this.
 
        Safety: There are no concurrent accesses to `env` at this point. -/
-    env ← unsafe Runtime.markPersistent env
+    env ← BuildTraceCore.observeImport 19 <| unsafe Runtime.markPersistent env
   if loadExts then
-    env ← finalizePersistentExtensions env moduleData opts
+    env ← BuildTraceCore.observeImport 5 <| finalizePersistentExtensions env moduleData opts
     if leakEnv then
       /- Ensure the final environment including environment extension states is
         marked persistent as documented.
 
         Safety: There are no concurrent accesses to `env` at this point, assuming
         extensions' `addImportFn`s did not spawn any unbound tasks. -/
-      env ← unsafe Runtime.markPersistent env
+      env ← BuildTraceCore.observeImport 19 <| unsafe Runtime.markPersistent env
   return { env with importRealizationCtx? := some {
     -- safety: `RealizationContext` is private
     env := unsafe unsafeCast env
@@ -2445,7 +2472,8 @@ def importModules (imports : Array Import) (opts : Options) (trustLevel : UInt32
       throw <| IO.userError "import failed, trying to import module with anonymous name"
   withImporting do
     plugins.forM fun {path, initFn?} => Lean.loadPlugin path initFn?
-    let (_, s) ← importModulesCore (globalLevel := level) imports arts |>.run
+    let (_, s) ← BuildTraceCore.observeImport 3 <|
+      importModulesCore (globalLevel := level) imports arts |>.run
     finalizeImport (leakEnv := leakEnv) (loadExts := loadExts) (level := level)
       s imports opts trustLevel
 
@@ -2715,7 +2743,15 @@ def realizeConst (env : Environment) (forConst : Name) (constName : Name)
     let realizeEnv := realizeEnv.enterAsyncRealizing constName
     -- skip kernel in `realize`, we'll re-typecheck anyway
     let realizeOpts := debug.skipKernelTC.set realizeOpts true
-    let (realizeEnv', dyn) ← realize realizeEnv realizeOpts
+    let (realizeEnv', dyn) ←
+      if !(← BuildTraceCore.coreEnabled) then
+        realize realizeEnv realizeOpts
+      else
+        let origin ← BuildTraceCore.coreScope
+        let id ← BuildTraceCore.coreWorkBegin 12 origin constName.toString
+        let result ← realize realizeEnv realizeOpts
+        BuildTraceCore.coreWorkEnd 12 id 1
+        pure result
     -- We could check that `c` was indeed added here but in practice `realize` has already
     -- reported an error so we don't.
 

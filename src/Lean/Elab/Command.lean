@@ -531,6 +531,27 @@ def wrapAsyncAsSnapshot {α : Type} (act : α → CommandElabM Unit) (cancelTk? 
 def logSnapshotTask (task : Language.SnapshotTask Language.SnapshotTree) : CommandElabM Unit :=
   modify fun s => { s with snapshotTasks := s.snapshotTasks.push task }
 
+@[extern "lbt_core_current_scope"] private opaque coreScope : BaseIO UInt64
+@[extern "lbt_core_work_begin"] private opaque coreWorkBegin
+    (kind : UInt32) (origin : UInt64) (label : @& String) : BaseIO UInt64
+@[extern "lbt_core_scope_end"] private opaque coreWorkEnd
+    (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+
+@[extern "lbt_core_binders_begin"] private opaque coreBindersBegin (active : UInt64) : BaseIO UInt64
+@[extern "lbt_core_binders_end"] private opaque coreBindersEnd
+    (id : UInt64) (status : UInt32) (rebuilt : UInt64) : BaseIO Unit
+
+private def coreInLinter (kind : UInt32) (origin : UInt64) (act : CommandElabM Unit) : CommandElabM Unit := do
+  let id ← coreWorkBegin kind origin ""
+  if id == 0 then return ← act
+  try
+    act
+    coreWorkEnd kind id 1
+  catch e =>
+    coreWorkEnd kind id 2
+    throw e
+
+
 open Language in
 def runLintersAsync (stx : Syntax) (cmds : Array Syntax) : CommandElabM Unit := do
   let lintersCodeQualityEntriesPromise ← IO.Promise.new (α := Array Linter.CodeQualityLogEntry)
@@ -559,7 +580,8 @@ def runLintersAsync (stx : Syntax) (cmds : Array Syntax) : CommandElabM Unit := 
   -- We only start one task for all linters for now as most linters are fast and we simply want
   -- to unblock elaboration of the next command
   let cancelTk ← IO.CancelToken.new
-  let lintAct ← wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun infoSt => do
+  let origin ← coreScope
+  let lintAct ← wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun infoSt => coreInLinter 10 origin do
     let messages := tree.getAll.map (·.diagnostics.msgLog) |>.foldl (· ++ ·) .empty
     -- do not double-report
     let messages := messages.markAllReported
@@ -617,7 +639,8 @@ def runStatefulLintersAsync (stx : Syntax) : CommandElabM Unit := do
   let lintersInfoPromise ← IO.Promise.new (α := InfoTree)
 
   let cancelTk ← IO.CancelToken.new
-  let lintAct ← wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun (prev, infoSt) => do
+  let origin ← coreScope
+  let lintAct ← wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun (prev, infoSt) => coreInLinter 11 origin do
     let messages := tree.getAll.map (·.diagnostics.msgLog) |>.foldl (· ++ ·) .empty
     let messages := messages.markAllReported
     modify fun st => { st with messages := st.messages ++ messages }
@@ -1023,28 +1046,35 @@ variable (n : Nat)
 def runTermElabM (elabFn : Array Expr → TermElabM α) : CommandElabM α := do
   let scope ← getScope
   liftTermElabM <|
-    Term.withAutoBoundImplicit <|
-      Term.elabBinders scope.varDecls fun xs => do
-        -- We need to synthesize postponed terms because this is a checkpoint for the auto-bound implicit feature
-        -- If we don't use this checkpoint here, then auto-bound implicits in the postponed terms will not be handled correctly.
-        Term.synthesizeSyntheticMVarsNoPostponing
-        let mut sectionFVars := {}
-        for uid in scope.varUIds, x in xs do
-          sectionFVars := sectionFVars.insert uid x
-        withReader ({ · with sectionFVars := sectionFVars }) do
-          -- We don't want to store messages produced when elaborating `(getVarDecls s)` because they have already been saved when we elaborated the `variable`(s) command.
-          -- So, we use `Core.resetMessageLog`.
-          Core.resetMessageLog
-          let xs ← Term.addAutoBoundImplicits xs none
-          if xs.all (·.isFVar) then
-            Term.withoutAutoBoundImplicit <| elabFn xs
-          else
-            -- Abstract any mvars that appear in `xs` using `mkForallFVars` (the type `mkSort Level.zero` is an arbitrary placeholder)
-            -- and then rebuild the local context from scratch.
-            -- Resetting prevents the local context from including the original fvars from `xs`.
-            let ctxType ← Meta.mkForallFVars' xs (mkSort Level.zero)
-            Meta.withLCtx {} {} <| Meta.forallBoundedTelescope ctxType xs.size fun xs _ =>
+    Term.withAutoBoundImplicit do
+      let id ← coreBindersBegin scope.varDecls.size.toUInt64
+      try
+        Term.elabBinders scope.varDecls fun xs => do
+          if id != 0 then coreBindersEnd id 1 xs.size.toUInt64
+          -- We need to synthesize postponed terms because this is a checkpoint for the auto-bound implicit feature
+          -- If we don't use this checkpoint here, then auto-bound implicits in the postponed terms will not be handled correctly.
+          Term.synthesizeSyntheticMVarsNoPostponing
+          let mut sectionFVars := {}
+          for uid in scope.varUIds, x in xs do
+            sectionFVars := sectionFVars.insert uid x
+          withReader ({ · with sectionFVars := sectionFVars }) do
+            -- We don't want to store messages produced when elaborating `(getVarDecls s)` because they have already been saved when we elaborated the `variable`(s) command.
+            -- So, we use `Core.resetMessageLog`.
+            Core.resetMessageLog
+            let xs ← Term.addAutoBoundImplicits xs none
+            if xs.all (·.isFVar) then
               Term.withoutAutoBoundImplicit <| elabFn xs
+            else
+              -- Abstract any mvars that appear in `xs` using `mkForallFVars` (the type `mkSort Level.zero` is an arbitrary placeholder)
+              -- and then rebuild the local context from scratch.
+              -- Resetting prevents the local context from including the original fvars from `xs`.
+              let ctxType ← Meta.mkForallFVars' xs (mkSort Level.zero)
+              Meta.withLCtx {} {} <| Meta.forallBoundedTelescope ctxType xs.size fun xs _ =>
+                Term.withoutAutoBoundImplicit <| elabFn xs
+      catch e =>
+        if id != 0 then coreBindersEnd id 2 0
+        throw e
+
 
 private def liftAttrM {α} (x : AttrM α) : CommandElabM α := do
   liftCoreM x

@@ -266,6 +266,21 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
+@[extern "lbt_core_span_begin"] private opaque corePhaseBegin (kind : UInt32) : BaseIO UInt64
+@[extern "lbt_core_span_end"] private opaque corePhaseEnd
+    (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+
+@[noinline] private def corePhase (kind : UInt32) (act : IO α) : IO α := do
+  let id ← corePhaseBegin kind
+  if id == 0 then return ← act
+  try
+    let result ← act
+    corePhaseEnd kind id 1
+    return result
+  catch e =>
+    corePhaseEnd kind id 2
+    throw e
+
 def runFrontend
     (input : String)
     (opts : Options)
@@ -338,7 +353,7 @@ def runFrontend
   let severityOverrides := errorOnKinds.foldl (·.insert · .error) {}
 
   -- reporting should be done before any early exit from the function
-  let hasErrors ← snaps.runAndReport opts jsonOutput severityOverrides
+  let hasErrors ← corePhase 18 <| snaps.runAndReport opts jsonOutput severityOverrides
 
   let some cmdState := Language.Lean.waitForFinalCmdState? snap
     | return none
@@ -383,23 +398,25 @@ def runFrontend
     return none
 
   if let some oleanFileName := oleanFileName? then
-    profileitIO ".olean serialization" finalOpts do
+    corePhase 15 <| profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
 
   if let some ileanFileName := ileanFileName? then
-    let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
-    let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
-    let (moduleRefs, decls) ← references.toLspModuleRefs
-    let ilean := {
-      module        := mainModuleName
-      directImports := Server.collectImports ⟨snap.stx⟩
-      references    := moduleRefs
-      decls
-      : Lean.Server.Ilean
-    }
-    IO.FS.writeFile ileanFileName $ Json.compress $ toJson ilean
+    let references ← corePhase 16 <| IO.lazyPure fun _ =>
+      let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
+      Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
+    corePhase 17 do
+      let (moduleRefs, decls) ← references.toLspModuleRefs
+      let ilean := {
+        module        := mainModuleName
+        directImports := Server.collectImports ⟨snap.stx⟩
+        references    := moduleRefs
+        decls
+        : Lean.Server.Ilean
+      }
+      IO.FS.writeFile ileanFileName $ Json.compress $ toJson ilean
 
   if let some out := trace.profiler.output.get? opts then
     let traceStates := snaps.getAll.map (·.traces)

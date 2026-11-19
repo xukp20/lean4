@@ -71,6 +71,9 @@ __attribute__((weak)) void free_sized(void *ptr, size_t) {
 #define LEAN_MAX_PRIO 8
 #define LEAN_SYNC_PRIO std::numeric_limits<unsigned>::max()
 
+extern "C" uint64_t lbt_core_wait_begin_task(const void *);
+extern "C" void lbt_core_wait_end(uint64_t);
+
 namespace lean {
 
 static bool should_abort_on_panic() {
@@ -724,6 +727,10 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
 
 LEAN_THREAD_PTR(lean_task_object, g_current_task_object);
 
+extern "C" uint64_t lbt_core_current_task_token(void) {
+    return reinterpret_cast<uintptr_t>(static_cast<lean_task_object *>(g_current_task_object));
+}
+
 static lean_task_imp * alloc_task_imp(obj_arg c, unsigned prio, bool keep_alive) {
     lean_task_imp * imp = (lean_task_imp*)lean_alloc_small_object(sizeof(lean_task_imp));
     imp->m_closure     = c;
@@ -1035,7 +1042,11 @@ public:
             else
                 m_queue_cv.notify_one();
         }
-        m_task_finished_cv.wait(lock, [&]() { return t->m_value != nullptr; });
+        while (t->m_value == nullptr) {
+            auto trace = lbt_core_wait_begin_task(t);
+            m_task_finished_cv.wait(lock);
+            if (trace) lbt_core_wait_end(trace);
+        }
         if (in_pool) {
             m_max_std_workers--;
         }

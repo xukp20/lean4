@@ -234,6 +234,12 @@ open Lean
 set_option linter.missingDocs true
 
 namespace Lean.Language.Lean
+
+@[extern "lbt_core_enabled"] private opaque coreEnabled : BaseIO Bool
+@[extern "lbt_core_command_begin"] private opaque coreCommandBegin (lo hi : UInt64) : BaseIO UInt64
+@[extern "lbt_core_scope_end"] private opaque coreCommandEnd
+    (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+@[extern "lbt_core_commands_end"] private opaque coreCommandsEnd : BaseIO Unit
 open Lean.Elab Command
 open Lean.Parser
 
@@ -679,9 +685,17 @@ where
           reportSnap := { stx? := none, reportingRange := initRange?, task := reportPromise.result!, cancelTk? := none }
         }
       }
+      let terminal := Parser.isTerminalCommand stx
+      let id ← if !terminal && (← coreEnabled) then do
+          coreCommandBegin
+            (stx.getPos?.map (·.byteIdx.toUInt64) |>.getD 18446744073709551615)
+            (stx.getTailPos?.map (·.byteIdx.toUInt64) |>.getD 18446744073709551615)
+        else pure 0
       let cmdState ← doElab stx cmds cmdState beginPos
         { old? := old?.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩, new := elabPromise }
         elabCmdCancelTk ctx
+      if id != 0 then coreCommandEnd 1 id 1
+      if terminal then coreCommandsEnd
 
       let mut reportedCmdState := cmdState
       let cmdline := internal.cmdlineSnapshots.get scope.opts && !Parser.isTerminalCommand stx

@@ -465,6 +465,23 @@ where
     eprint s!"error: argument value for '-{opt}' is too large\n"
     throw 1
 
+@[extern "lbt_core_span_begin"] private opaque corePhaseBegin (kind : UInt32) : BaseIO UInt64
+@[extern "lbt_core_span_end"] private opaque corePhaseEnd
+    (kind : UInt32) (id : UInt64) (status : UInt32) : BaseIO Unit
+
+@[noinline] private def corePhase (kind : UInt32) (act : IO α) : IO α := do
+  let id ← corePhaseBegin kind
+  if id == 0 then return ← act
+  try
+    let result ← act
+    corePhaseEnd kind id 1
+    return result
+  catch e =>
+    corePhaseEnd kind id 2
+    throw e
+
+@[extern "lbt_core_configure_env"] private opaque coreConfigure : BaseIO UInt32
+
 @[export lean_shell_main]
 def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
   let opts := { opts with leanOpts := opts.leanOpts.mergeBy (fun _ _ v => v) (Internal.getOptionOverrides ()) }
@@ -538,6 +555,9 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
       pure (contents.sliceFrom endLinePos).copy
     else
       pure contents
+  let err ← coreConfigure
+  if err != 0 then
+    throw <| IO.userError s!"core trace sink configure failed: {err}"
   let setup? ← opts.setupFileName?.mapM ModuleSetup.load
   let mainModuleName ←
     if let some setup := setup? then
@@ -560,14 +580,14 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
     if opts.run then
       return ← runMain env opts.leanOpts args
     if let some c := opts.cFileName? then
-      writeFileAtomically c fun out => do
+      corePhase 20 <| writeFileAtomically c fun out => do
         profileitIO "C code generation" opts.leanOpts do
           let data ← Compiler.LCNF.emitC mainModuleName
             |>.toIO' { fileName, fileMap := default } { env }
           out.write data.toUTF8
     if let some bc := opts.bcFileName? then
       initLLVM
-      profileitIO "LLVM code generation" opts.leanOpts do
+      corePhase 20 <| profileitIO "LLVM code generation" opts.leanOpts do
         emitLLVM env mainModuleName bc
   displayCumulativeProfilingTimes
   if Internal.hasAddressSanitizer () then
