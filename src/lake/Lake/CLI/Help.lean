@@ -60,6 +60,9 @@ BASIC OPTIONS:
   --allow-empty         accept bare builds with no default targets configured
   --no-build            exit immediately if a build target is not up-to-date
   --fail-fast           stop scheduling new build jobs after the first required failure
+  --jobs=<P>            enable compiler admission control and use P threads per Lean process
+  --max-procs=<K>       cap concurrent Lean compiler processes at K and at the CPU budget
+                        with --max-procs alone, the CPU budget is detected automatically
   --no-cache            build packages locally; do not download build caches
   --try-cache           attempt to download build caches for supported packages
   --json, -J            output JSON-formatted results (in `lake query`)

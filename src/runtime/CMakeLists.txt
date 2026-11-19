@@ -61,6 +61,7 @@ set(
   RUNTIME_OBJS
   debug.cpp
   thread.cpp
+  available_parallelism.cpp
   mpz.cpp
   utf8.cpp
   object.cpp

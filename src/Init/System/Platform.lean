@@ -70,6 +70,15 @@ The platform's native concurrency limit (number of hardware threads), or `0` if 
 @[extern "lean_internal_get_hardware_concurrency"]
 opaque Internal.getHardwareConcurrency : Unit → UInt32
 
+/--
+An estimate of the default parallelism available to the calling thread, always at least one.
+On Linux, considers CPU affinity and readable cgroup CPU quotas, including visible ancestors.
+Fractional quotas round up. Limits hidden by namespaces, contention from other processes, and
+changes after initialization are not reflected in an already initialized task pool.
+-/
+@[extern "lean_internal_get_available_parallelism"]
+opaque Internal.getAvailableParallelism : Unit → UInt32
+
 @[simp]
 theorem numBits_pos : 0 < numBits := by
   cases numBits_eq <;> next h => simp [h]

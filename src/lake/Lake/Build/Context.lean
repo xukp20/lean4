@@ -9,6 +9,7 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
+public import Lake.Build.CompilerBudget
 
 open System
 namespace Lake
@@ -23,6 +24,10 @@ public structure BuildConfig extends LogConfig where
   noBuild : Bool := false
   /-- Stop scheduling new build jobs after the first required target failure. -/
   failFast : Bool := false
+  /-- Fixed Lean compiler thread budget. Supplying it enables compiler admission control. -/
+  jobs? : Option Nat := none
+  /-- Maximum simultaneously active Lean compiler processes. -/
+  maxProcs? : Option Nat := none
   /-- Verbosity level (`-q`, `-v`, or neither). -/
   verbosity : Verbosity := .normal
   /-- Whether to print a message when the build finishes successfully (if not quiet). -/
@@ -87,6 +92,7 @@ public structure BuildContext extends BuildConfig, Context where
   leanTrace : BuildTrace
   leanIncludeDirs : Array (Option (FilePath × BuildTrace))
   registeredJobs : JobQueue
+  compilerBudget? : Option CompilerBudget := none
   /--
   Input-to-output(s) map for hashes of the tracked package's artifacts.
   If `none`, tracking outputs is disabled for this build.
