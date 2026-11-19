@@ -12,6 +12,7 @@ public import Init.System.Promise
 public import Init.System.CancelToken
 public import Lean.Data.NameTrie
 public import Lean.Setup
+public import Lean.ModuleJobConfig
 public import Lean.LocalContext
 public import Lean.Util.Path
 public import Lean.Util.FindExpr
@@ -1842,6 +1843,15 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
   -- safety: `EnvExtensionState` is opaque, so we can upcast to it
   EnvExtension.envExtensionsRef.modify fun exts => exts.push (unsafe unsafeCast ext)
   pure ext
+
+private builtin_initialize moduleJobConfigExt : EnvExtension ModuleJobConfig ←
+  registerEnvExtension (asyncMode := .local) (pure {})
+
+def Environment.moduleJobConfig (env : Environment) : ModuleJobConfig :=
+  moduleJobConfigExt.getState env
+
+def Environment.setModuleJobConfig (env : Environment) (config : ModuleJobConfig) : Environment :=
+  moduleJobConfigExt.setState env config
 
 private def mkInitialExtensionStates : IO (Array EnvExtensionState) := EnvExtension.mkInitialExtStates
 

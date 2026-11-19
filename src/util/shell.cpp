@@ -22,6 +22,7 @@ Author: Leonardo de Moura
 #include "runtime/array_ref.h"
 #include "runtime/object_ref.h"
 #include "runtime/option_ref.h"
+#include <cerrno>
 #include "runtime/utf8.h"
 #include "util/macros.h"
 #include "util/io.h"
@@ -154,6 +155,24 @@ int getopt_long(int argc, char *in_argv[], const char *optstring, const option *
 
 using namespace lean; // NOLINT
 
+// Keep base usable without a probe; explicit profiling then fails with ENOSYS.
+#if defined(__GNUC__) && !defined(LEAN_WINDOWS)
+extern "C" uint32_t lbt_core_configure_options(b_lean_obj_arg, uint32_t, uint64_t) __attribute__((weak));
+#endif
+extern "C" LEAN_EXPORT uint32_t lean_internal_configure_profile(
+    b_lean_obj_arg dir, uint32_t level, uint64_t slow_us) {
+#if defined(__GNUC__) && !defined(LEAN_WINDOWS)
+    if (lbt_core_configure_options) {
+        std::string path = std::string(lean_string_cstr(dir)) + "/" + std::to_string(getpid()) + ".bin";
+        lean_object * value = lean_mk_string(path.c_str());
+        uint32_t result = lbt_core_configure_options(value, level, slow_us);
+        lean_dec(value);
+        return result;
+    }
+#endif
+    return ENOSYS;
+}
+
 static struct option g_long_options[] = {
     {"version",      no_argument,       0, 'v'},
     {"help",         no_argument,       0, 'h'},
@@ -167,6 +186,9 @@ static struct option g_long_options[] = {
     {"memory",       required_argument, 0, 'M'},
     {"trust",        required_argument, 0, 't'},
     {"profile",      no_argument,       0, 'P'},
+    {"profile-trace", required_argument, 0, 'F'},
+    {"profile-level", required_argument, 0, 'G'},
+    {"profile-slow-us", required_argument, 0, 'K'},
     {"stats",        no_argument,       0, 'a'},
     {"quiet",        no_argument,       0, 'q'},
     {"deps",         no_argument,       0, 'd'},

@@ -9,12 +9,15 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
+public import Lean.ModuleJobConfig
 
 open System
 namespace Lake
 
 /-- Configuration options for a Lake build. -/
 public structure BuildConfig extends LogConfig where
+  /-- Profiler transport, deliberately excluded from semantic module traces. -/
+  moduleJobConfig : Lean.ModuleJobConfig := {}
   /-- Whether to use modification times for trace checking. -/
   oldMode : Bool := false
   /-- Whether to trust `.hash` files. -/

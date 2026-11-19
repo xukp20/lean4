@@ -1105,6 +1105,12 @@ def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
   let args := mod.weakLeanArgs ++ mod.leanArgs
+  -- Append only after recFetchPreSetup has computed Module.trace.
+  let cfg := (← getBuildContext).moduleJobConfig
+  let args := if let some dir := cfg.profileTrace? then
+    let level := if cfg.profileLevel == 0 then "macro" else if cfg.profileLevel == 2 then "defeq" else "tactic"
+    args ++ #[s!"--profile-trace={dir}", s!"--profile-level={level}", s!"--profile-slow-us={cfg.profileSlowUs}"]
+  else args
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← mkModuleSetup mod presetup
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule

@@ -47,6 +47,9 @@ COMMANDS:
   serve                 start the Lean language server
 
 BASIC OPTIONS:
+  --profile-trace=dir   write per-process unified profiler traces (non-semantic)
+  --profile-level=level macro, tactic (default) or defeq
+  --profile-slow-us=num minimum retained fine-grained duration (default: 200)
   --version             print version and exit
   --help, -h            print help of the program or a command and exit
   --dir, -d=file        use the package configuration in a specific directory

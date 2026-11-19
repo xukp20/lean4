@@ -167,6 +167,9 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "      --print-prefix     print the installation prefix for Lean and exit"
   out.putStrLn    "      --print-libdir     print the installation directory for Lean's built-in libraries and exit"
   out.putStrLn    "      --profile          display elaboration/type checking time for each definition/theorem"
+  out.putStrLn    "      --profile-trace=dir write unified profiler binary traces (non-semantic)"
+  out.putStrLn    "      --profile-level=macro|tactic|defeq (default: tactic)"
+  out.putStrLn    "      --profile-slow-us=num minimum retained fine-grained duration (default: 200)"
   out.putStrLn    "      --stats            display environment statistics"
   out.putStrLn    "      --incr-save=file   EXPERIMENTAL: save a full incremental snapshot of post-elaboration state at end of run"
   out.putStrLn    "      --incr-load=file   EXPERIMENTAL: reuse a snapshot saved by `--incr-(header-)save` at start of run"
@@ -213,7 +216,12 @@ def defaultNumThreads : UInt32 :=
     Platform.Internal.getHardwareConcurrency ()
   else 0
 
+/-- Optional profiler sink in full SDKs; returns an error when no probe is linked. -/
+@[extern "lean_internal_configure_profile"]
+private opaque configureProfile (dir : @& String) (level : UInt32) (slowUs : UInt64) : BaseIO UInt32
+
 structure ShellOptions where
+  moduleJobConfig : ModuleJobConfig := {}
   leanOpts : Options := {}
   forwardedArgs : Array String := #[]
   component : ShellComponent := .frontend
@@ -393,6 +401,29 @@ def ShellOptions.process (opts : ShellOptions)
     return {opts with component := .watchdog}
   | 'W' => -- `--worker`
     return {opts with component := .worker}
+  | 'F' => -- `--profile-trace=dir`
+    let arg ← checkOptArg "profile-trace" optArg?
+    if arg.isEmpty then liftIO <| throw <| IO.userError "profile trace directory must not be empty"
+    return {opts with
+      forwardedArgs := opts.forwardedArgs.push s!"--profile-trace={arg}"
+      moduleJobConfig := {opts.moduleJobConfig with profileTrace? := some arg}}
+  | 'G' => -- `--profile-level=macro|tactic|defeq`
+    let arg ← checkOptArg "profile-level" optArg?
+    let level : UInt32 ← match arg with
+      | "macro" => pure 0
+      | "tactic" => pure 1
+      | "defeq" => pure 2
+      | _ => liftIO <| throw <| IO.userError "profile level must be macro, tactic or defeq"
+    return {opts with
+      forwardedArgs := opts.forwardedArgs.push s!"--profile-level={arg}"
+      moduleJobConfig := {opts.moduleJobConfig with profileLevel := level}}
+  | 'K' => -- `--profile-slow-us=num`
+    let arg ← checkOptArg "profile-slow-us" optArg?
+    let some slow := arg.toNat? | throwExpectedNumeric "profile-slow-us"
+    if slow >= UInt64.size then throwTooLarge "profile-slow-us"
+    return {opts with
+      forwardedArgs := opts.forwardedArgs.push s!"--profile-slow-us={arg}"
+      moduleJobConfig := {opts.moduleJobConfig with profileSlowUs := slow.toUInt64}}
   | 'P' => -- `--profile`
     return {opts with leanOpts := profiler.set opts.leanOpts true}
   | 'B' => -- `--debug=tag`
@@ -464,6 +495,11 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
   if opts.printLibDir then
     IO.println (← getLibDir (← getBuildDir))
     return 0
+  if let some dir := opts.moduleJobConfig.profileTrace? then
+    IO.FS.createDirAll dir
+    let err ← configureProfile dir opts.moduleJobConfig.profileLevel opts.moduleJobConfig.profileSlowUs
+    if err != 0 then
+      throw <| IO.userError s!"native profiler configuration failed: {err}"
   let maxMemory := maxMemory.get opts.leanOpts
   if maxMemory != 0 then
     Internal.setMaxMemory (maxMemory.toUSize * 1024 * 1024)

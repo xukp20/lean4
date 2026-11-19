@@ -44,6 +44,7 @@ namespace Lake
 /-! ## General options for top-level `lake` -/
 
 public structure LakeOptions where
+  moduleJobConfig : Lean.ModuleJobConfig := {}
   args : List String := []
   rootDir : FilePath := "."
   configFile : FilePath := defaultConfigFile
@@ -152,6 +153,7 @@ def LakeOptions.mkBuildConfig
   (opts : LakeOptions) (out := OutStream.stderr) (showSuccess := false)
   (outputsPackage? : Option Package := none)
 : BuildConfig where
+  moduleJobConfig := opts.moduleJobConfig
   oldMode := opts.oldMode
   trustHash := opts.trustHash
   noBuild := opts.noBuild
@@ -371,6 +373,27 @@ def lakeLongOption : (opt : String) → CliM PUnit
 | "--file"        => do
   let configFile ← takeOptArg "--file" "path"
   modifyThe LakeOptions ({· with configFile})
+| "--profile-trace" => do
+  let dir ← takeOptArg "--profile-trace" "profiler output directory"
+  if dir.isEmpty then error "profile trace directory must not be empty"
+  let dir := (← IO.currentDir) / dir
+  modifyThe LakeOptions fun opts =>
+    {opts with moduleJobConfig := {opts.moduleJobConfig with profileTrace? := some dir.toString}}
+| "--profile-level" => do
+  let arg ← takeOptArg "--profile-level" "macro, tactic or defeq"
+  let level : UInt32 ← match arg with
+    | "macro" => pure 0
+    | "tactic" => pure 1
+    | "defeq" => pure 2
+    | _ => error "profile level must be macro, tactic or defeq"
+  modifyThe LakeOptions fun opts =>
+    {opts with moduleJobConfig := {opts.moduleJobConfig with profileLevel := level}}
+| "--profile-slow-us" => do
+  let arg ← takeOptArg "--profile-slow-us" "minimum retained event duration"
+  let some slow := arg.toNat? | error "profile slow-us must be a natural number"
+  if slow >= UInt64.size then error "profile slow-us is too large"
+  modifyThe LakeOptions fun opts =>
+    {opts with moduleJobConfig := {opts.moduleJobConfig with profileSlowUs := slow.toUInt64}}
 | "--help"        => modifyThe LakeOptions ({· with wantsHelp := true})
 | "--"            => do
   let subArgs ← takeArgs
