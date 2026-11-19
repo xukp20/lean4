@@ -266,6 +266,13 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
+private def notifyOLeanReady (mod : Name) (fname : System.FilePath) : IO Unit := do
+  IO.println <| (Json.mkObj [
+    ("kind", toJson "lean.oleanReady"),
+    ("module", toJson mod.toString),
+    ("olean", toJson fname.toString)]).compress
+  (← IO.getStdout).flush
+
 def runFrontend
     (input : String)
     (opts : Options)
@@ -282,7 +289,10 @@ def runFrontend
     (incrSaveFileName? : Option System.FilePath := none)
     (incrLoadFileName? : Option System.FilePath := none)
     (incrHeaderSaveFileName? : Option System.FilePath := none)
+    (oleanEarlyRelease : Bool := false)
     : IO (Option Environment) := do
+  if oleanEarlyRelease && System.Platform.isWindows then
+    throw <| IO.userError "early olean release requires POSIX interruption cleanup"
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
@@ -386,7 +396,10 @@ def runFrontend
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+      let writeIR := !Compiler.compiler.postponeCompile.get finalOpts
+      writeModule (writeIR := writeIR) env oleanFileName
+      if oleanEarlyRelease && env.header.isModule && writeIR then
+        notifyOLeanReady env.mainModule oleanFileName
 
   if let some ileanFileName := ileanFileName? then
     let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])

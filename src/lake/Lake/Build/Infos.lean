@@ -102,6 +102,9 @@ including transitive imports, plugins, and those specified by `needs`.
 -/
 builtin_facet presetup : Module => ModulePreSetup
 
+/-- Canonical setup trace after all proof-derived import data is complete. -/
+builtin_facet fullPresetup : Module => ModulePreSetup
+
 /-- The transitive local imports of the Lean module. -/
 builtin_facet transImports : Module => Array Module
 
@@ -183,6 +186,18 @@ namespace Module
 
 @[inherit_doc exportInfoFacet] public abbrev exportInfo (self : Module) :=
   self.facetCore exportInfoFacet
+
+@[inherit_doc earlyImportInfoFacet] public abbrev earlyImportInfo (self : Module) :=
+  self.facetCore earlyImportInfoFacet
+
+@[inherit_doc earlyExportInfoFacet] public abbrev earlyExportInfo (self : Module) :=
+  self.facetCore earlyExportInfoFacet
+
+@[inherit_doc releasedOLeanFacet] public abbrev releasedOLean (self : Module) :=
+  self.facetCore releasedOLeanFacet
+
+@[inherit_doc fullPresetupFacet] public abbrev fullPresetup (self : Module) :=
+  self.facetCore fullPresetupFacet
 
 @[inherit_doc importArtsFacet] public abbrev importArts (self : Module) :=
   self.facetCore importArtsFacet
