@@ -1160,6 +1160,17 @@ private def Module.earlyPublicSetup? (mod : Module) : FetchM (Option (Job Module
         trace := info.trace.mix pub.transTrace |>.mix pub.artsTrace.withoutInputs}
   return some job
 
+/-- Install a complete file even when the private scratch directory is on a
+different filesystem. The destination belongs to this module's build job. -/
+private def publishEOIFile (src dst : FilePath) : IO Unit := do
+  createParentDirs dst
+  let tmp := dst.addExtension "eoi-part"
+  try
+    copyFile src tmp
+    IO.FS.rename tmp dst
+  finally
+    removeFileIfExists tmp
+
 private def Module.buildEarlyPublic (mod : Module) (early : ModulePreSetup)
     (finalJob : Job ModulePreSetup) : JobM ModuleOutputArtifacts := do
   setTrace early.trace
@@ -1169,8 +1180,11 @@ private def Module.buildEarlyPublic (mod : Module) (early : ModulePreSetup)
       let path := dir / "module.olean"
       let ilean := dir / "module.ilean"
       let bc := dir / "module.bc"
-      let arts : ModuleArtifacts := {olean? := some path, ilean? := some ilean,
-        bc? := if Lean.Internal.hasLLVMBackend () then some bc else none}
+      let arts : ModuleArtifacts := {
+        olean? := some path
+        ilean? := some ilean
+        bc? := if Lean.Internal.hasLLVMBackend () then some bc else none
+      }
       compileLeanModule early.srcFile (relPathFrom mod.pkg.dir early.srcFile) setup
         (dir / "setup.json") arts (← mod.compilerArgs) (← getLeanPath) (← getLean)
       -- Only the canonical presetup has the complete IR signature and all
@@ -1183,15 +1197,11 @@ private def Module.buildEarlyPublic (mod : Module) (early : ModulePreSetup)
       mod.clearOutputArtifacts
       mod.clearOutputHashes
       try
-        for (src, dst) in #[(path, mod.oleanFile),
-            (OLeanLevel.server.adjustFileName path, mod.oleanServerFile),
-            (OLeanLevel.private.adjustFileName path, mod.oleanPrivateFile),
-            (ilean, mod.ileanFile)] do
-          createParentDirs dst
-          copyFile src dst
-        if arts.bc?.isSome then
-          createParentDirs mod.bcFile
-          copyFile bc mod.bcFile
+        publishEOIFile (OLeanLevel.server.adjustFileName path) mod.oleanServerFile
+        publishEOIFile (OLeanLevel.private.adjustFileName path) mod.oleanPrivateFile
+        publishEOIFile ilean mod.ileanFile
+        if arts.bc?.isSome then publishEOIFile bc mod.bcFile
+        publishEOIFile path mod.oleanFile
         mod.computeArtifacts true true
       catch e =>
         mod.clearOutputArtifacts
@@ -1406,11 +1416,10 @@ def Module.recBuildIRArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) :=
           let c := dir / "module.c"
           compileLeanIR mod.irSetupFile ir c (← getLeanPath) (← getLeanir)
           try
-            createParentDirs mod.cFile
-            copyFile (ir.addExtension "sig") mod.irSigFile
-            copyFile c mod.cFile
+            publishEOIFile (ir.addExtension "sig") mod.irSigFile
+            publishEOIFile c mod.cFile
             -- Lake checks irFile for reuse. Install it last.
-            copyFile ir mod.irFile
+            publishEOIFile ir mod.irFile
           catch e =>
             mod.clearIROutputArtifacts
             throw e
