@@ -42,7 +42,7 @@ private def getTransparencyExt : Phase → EnvExtension (List Name × NameSet)
 def isDeclTransparent (env : Environment) (phase : Phase) (declName : Name) : Bool := Id.run do
   if !env.header.isModule then
     return true
-  let (_, map) := getTransparencyExt phase |>.getState env
+  let (_, map) := (getTransparencyExt phase).getState (asyncMode := if env.eoiExporting then .local else .sync) env
   map.contains declName
 
 def setDeclTransparent (env : Environment) (phase : Phase) (declName : Name) : Environment :=

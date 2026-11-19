@@ -458,7 +458,11 @@ def mkHCongrWithArityForConst? (declName : Name) (levels : List Level) (numArgs 
     let proof := mkConst thmName levels
     let type ← inferType proof
     let some argKinds := congrKindsExt.find? (← getEnv) thmName
-      | unreachable!
+      | if (← getEnv).moduleJobConfig.eoiEarlyOlean then
+          trace[congr.thm] "missing congruence argument kinds for `{thmName}`"
+          return none
+        else
+          unreachable!
     return some { proof, type, argKinds }
   catch _ =>
     return none
@@ -472,10 +476,17 @@ def mkCongrSimpForConst? (declName : Name) (levels : List Level) : MetaM (Option
   try
     unless (← getEnv).containsOnBranch thmName do
       let _ ← executeReservedNameAction thmName
+    if (← getEnv).moduleJobConfig.eoiEarlyOlean then
+      unless (← getEnv).containsOnBranch thmName do
+        return none
     let proof := mkConst thmName levels
     let type ← inferType proof
     let some argKinds := congrKindsExt.find? (← getEnv) thmName
-      | unreachable!
+      | if (← getEnv).moduleJobConfig.eoiEarlyOlean then
+          trace[congr.thm] "missing congruence argument kinds for `{thmName}`"
+          return none
+        else
+          unreachable!
     return some { proof, type, argKinds }
   catch ex =>
     trace[congr.thm] "failed to generate `{thmName}` {ex.toMessageData}"

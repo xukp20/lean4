@@ -7,6 +7,9 @@ module
 
 prelude
 public import Lean.MonadEnv
+import Lean.Data.Json.FromToJson.Basic
+import Init.System.Platform
+import Init.While
 
 namespace Lean
 
@@ -98,15 +101,50 @@ private structure ExportedAxiomsState where
 
 instance : Inhabited ExportedAxiomsState := ⟨{}⟩
 
+private def deferredAxioms : Array (Name × Array Name) :=
+  #[(.anonymous, #[`__eoiDeferred])]
+
+/-- A deferred table denotes one immutable module result. Failure must never mean no axioms. -/
+private unsafe def loadDeferredAxiomsUnsafe (path : System.FilePath) (constant : Name) :
+    Array Name := unsafeBaseIO do
+  let result ← (show IO (Array Name) from do
+    let sidecar := path.addExtension "axioms"
+    while !(← sidecar.pathExists) do
+      let pending := path.addExtension "eoi"
+      unless (← path.pathExists) && (← pending.pathExists) do
+        throw <| IO.userError s!"deferred axiom table is unavailable for '{path}'"
+      let owner ← IO.FS.readFile pending
+      if System.Platform.isLinux && !(← (System.FilePath.mk s!"/proc/{owner}").pathExists) then
+        throw <| IO.userError s!"deferred axiom producer has exited for '{path}'"
+      IO.sleep 10
+    let json ← IO.ofExcept <| Json.parse (← IO.FS.readFile sidecar)
+    let entries ← IO.ofExcept (fromJson? json : Except String (Array (Name × Array Name)))
+    let some (_, axioms) := entries.binSearch (constant, #[]) (fun a b => Name.quickLt a.1 b.1)
+      | throw <| IO.userError s!"missing axiom entry for '{constant}' in '{sidecar}'"
+    pure axioms) |>.toBaseIO
+  match result with
+  | .ok entries => return entries
+  | .error e =>
+    let _ ← (IO.eprintln s!"error: {e}" : IO Unit).toBaseIO
+    let _ ← (IO.Process.exit 1 : IO Unit).toBaseIO
+    unreachable!
+
+@[implemented_by loadDeferredAxiomsUnsafe]
+private opaque loadDeferredAxioms (path : System.FilePath) (constant : Name) : Array Name
+
 /-- Look up pre-computed axioms for an imported declaration. -/
 private def ExportedAxiomsState.find? (s : ExportedAxiomsState) (env : Environment)
     (c : Name) : Option (Array Name) :=
   match env.getModuleIdxFor? c with
   | some modIdx =>
     if h : modIdx.toNat < s.importedModuleEntries.size then
-      match s.importedModuleEntries[modIdx].binSearch (c, #[]) (fun a b => Name.quickLt a.1 b.1) with
-      | some entry => some entry.2
-      | none       => none
+      let entries := s.importedModuleEntries[modIdx]
+      if entries == deferredAxioms then
+        some <| loadDeferredAxioms env.moduleOLeanFiles[modIdx]! c
+      else
+        match entries.binSearch (c, #[]) (fun a b => Name.quickLt a.1 b.1) with
+        | some entry => some entry.2
+        | none       => none
     else none
   | none => none
 
@@ -124,26 +162,35 @@ private builtin_initialize exportedAxiomsExt :
     addImportedFn := fun importedEntries => pure { importedModuleEntries := importedEntries }
     addEntryFn    := fun s _ => s
     exportEntriesFnEx := fun env s =>
-      let exportedEnv := env.setExporting true
-      let privateEnv := env.setExporting false
-      -- Collect current-module declarations visible in the exported view.
-      -- By pre-computing axiom data for every exported declaration, downstream modules can
-      -- look up any imported declaration without walking its body, keeping collection
-      -- module-local.
-      let allNames := env.checked.get.constants.foldStage2
-        (fun names name _ =>
-          if (exportedEnv.find? name).isSome then names.push name
-          else names) #[]
-      -- Compute axioms within a shared state (for caching across declarations).
-      -- Use `privateEnv` so that `collect` can see all constant bodies.
-      let entries := CollectAxioms.runM privateEnv do
-        allNames.mapM fun name =>
-          return (name, ← CollectAxioms.collectAndGet s.find? name)
-      -- Sort by name for binary search at import time.
-      let entries := entries.qsort fun a b => Name.quickLt a.1 b.1
-      .uniform entries
+      if env.eoiExporting then .uniform deferredAxioms else Id.run do
+        let exportedEnv := env.setExporting true
+        let privateEnv := env.setExporting false
+        -- Collect current-module declarations visible in the exported view.
+        -- By pre-computing axiom data for every exported declaration, downstream modules can
+        -- look up any imported declaration without walking its body, keeping collection
+        -- module-local.
+        let allNames := env.checked.get.constants.foldStage2
+          (fun names name _ =>
+            if (exportedEnv.find? name).isSome then names.push name
+            else names) #[]
+        -- Compute axioms within a shared state (for caching across declarations).
+        -- Use `privateEnv` so that `collect` can see all constant bodies.
+        let entries := CollectAxioms.runM privateEnv do
+          allNames.mapM fun name =>
+            return (name, ← CollectAxioms.collectAndGet s.find? name)
+        -- Sort by name for binary search at import time.
+        let entries := entries.qsort fun a b => Name.quickLt a.1 b.1
+        .uniform entries
     asyncMode     := .mainOnly
   }
+
+/-- Save the completed table alongside an EOI public interface. -/
+public def writeEOIAxioms (env : Environment) (path : System.FilePath) : IO Unit := do
+  let state := exportedAxiomsExt.getState (asyncMode := .mainOnly) env
+  let entries := exportedAxiomsExt.exportEntriesFn env state |>.exported
+  let tmp := path.addExtension "axioms.tmp"
+  IO.FS.writeFile tmp (toJson entries).compress
+  IO.FS.rename tmp (path.addExtension "axioms")
 
 /-- Collect all axioms transitively used by a constant. -/
 public def collectAxioms [Monad m] [MonadEnv m] (constName : Name) : m (Array Name) := do

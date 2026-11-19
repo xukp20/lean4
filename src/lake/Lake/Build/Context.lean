@@ -42,6 +42,8 @@ public structure BuildConfig extends LogConfig where
   linter-tagged warnings), without touching dependencies.
   -/
   leanOptOverrides : Lean.NameMap Lean.LeanOptions := {}
+  /-- Packages whose ordinary imports may consume provisional public interfaces. -/
+  eoiEarlyOleanPackages : Lean.NameSet := {}
   /--
   The miniumum OS version to target on MacOS.
 
@@ -87,6 +89,9 @@ public structure BuildContext extends BuildConfig, Context where
   leanTrace : BuildTrace
   leanIncludeDirs : Array (Option (FilePath × BuildTrace))
   registeredJobs : JobQueue
+  /-- Compiler readiness cells; all full jobs remain registered with the monitor. -/
+  eoiInterfaces? : Option (IO.Ref (Lean.NameMap (IO.Promise (JobResult Artifact)))) := none
+
   /--
   Input-to-output(s) map for hashes of the tracked package's artifacts.
   If `none`, tracking outputs is disabled for this build.

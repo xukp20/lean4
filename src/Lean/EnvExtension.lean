@@ -134,7 +134,7 @@ def mkMapDeclarationExtension (name : Name := by exact decl_name%)
     (exportEntriesFn : Environment → NameMap α → OLeanEntries (Array (Name × α)) :=
       -- Do not export info for private defs by default
       fun env s =>
-        let all := s.toArray.filter (fun (n, _) => env.contains (skipRealize := false) n)
+        let all := s.toArray.filter (fun (n, _) => env.contains (skipRealize := env.eoiExporting) n)
         .uniform all) :
     IO (MapDeclarationExtension α) :=
   .mk <$> registerPersistentEnvExtension {

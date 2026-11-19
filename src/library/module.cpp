@@ -113,7 +113,8 @@ struct olean_header {
     uint8_t version;
     // 1 byte of flags:
     // * bit 0: whether persisted bignums use GMP or Lean-native encoding
-    // * bit 1-7: reserved
+    // * bit 1: EOI public projection; axiom dependencies require the adjacent sidecar
+    // * bit 2-7: reserved
     uint8_t flags =
 #ifdef LEAN_USE_GMP
         0b1;
@@ -267,7 +268,7 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
 
 extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
                                                            b_obj_arg odep_regions, obj_arg oprev,
-                                                           uint8 allow_closures_u8, object *) {
+                                                           uint8 allow_closures_u8, uint8 deferred_axioms_u8) {
     // `mmap` addresses must be page-aligned. The default (non-huge) page size on x86-64 is 4KB;
     // `MapViewOfFileEx` addresses must be aligned to the "memory allocation granularity" (64KB).
     const size_t ALIGN = 1LL<<16;
@@ -326,6 +327,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             compactor.alloc(sizeof(olean_header));
             olean_header header = {};
             header.version = 2;
+            if (deferred_axioms_u8) header.flags |= 0b10;
             header.base_addr = reinterpret_cast<size_t>(compactor.base_addr()) + file_offset;
             strncpy(header.lean_version, get_short_version_string().c_str(), sizeof(header.lean_version));
             strncpy(header.githash, LEAN_GITHASH, sizeof(header.githash));
@@ -487,7 +489,8 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             || memcmp(header.marker, default_header.marker, sizeof(header.marker)) != 0) {
             return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', invalid header").str());
         }
-        if ((header.version != 2 && header.version != 3) || header.flags != default_header.flags
+        if ((header.version != 2 && header.version != 3) ||
+            (header.flags & ~0b10) != default_header.flags
 #ifdef LEAN_CHECK_OLEAN_VERSION
             || strncmp(header.githash, LEAN_GITHASH, sizeof(header.githash)) != 0
 #endif

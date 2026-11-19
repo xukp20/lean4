@@ -14,6 +14,7 @@ import Lake.Util.Url
 import Init.Data.String.Search
 import Init.Data.String.TakeDrop
 import Init.System.Platform
+import Init.While
 import Lean.CoreM
 import Lean.Compiler.Options
 
@@ -34,6 +35,9 @@ public def compileLeanModule
   (leanPath : SearchPath := [])
   (lean : FilePath := "lean")
   (leanir : FilePath := "leanir")
+  (eoiEarlyOlean : Bool := false)
+  (eoiLeaf : Bool := false)
+  (onInterfaceReady : FilePath → IO Unit := fun _ => pure ())
 : LogIO Unit := do
   let mut args := leanArgs.push leanFile.toString
   if let some oleanFile := arts.olean? then
@@ -55,14 +59,53 @@ public def compileLeanModule
   IO.FS.writeFile setupFile (toJson setup).pretty
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
+  if eoiEarlyOlean then
+    args := args.push "--enable-optimization=eoi-early-olean"
   withLogErrorPos do
-  let out ← rawProc {
+  let spawnArgs : IO.Process.SpawnArgs := {
     args
     cmd := lean.toString
-    env := #[
-      ("LEAN_PATH", leanPath.toString)
-    ]
+    env := #[("LEAN_PATH", leanPath.toString), ("LEAN_EOI_LEAF", if eoiLeaf then some "1" else none)]
   }
+  let out ← if eoiEarlyOlean && setup.isModule then do
+    logVerbose (mkCmdLog spawnArgs)
+    let readOutput : IO IO.Process.Output := do
+      let child ← IO.Process.spawn { spawnArgs with
+        stdin := .null, stdout := .piped, stderr := .piped }
+      let stderrTask ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
+      try
+        let mut stdout := ""
+        let mut errors := false
+        let mut notified := false
+        repeat
+          let line ← child.stdout.getLine
+          if line.isEmpty then break
+          let json := (Json.parse line).toOption
+          let stringField (key : String) := json.bind fun j => (j.getObjValAs? String key).toOption
+          if stringField "kind" == some "lean.eoiReady" then
+            unless notified || errors do
+              if let some path := arts.olean? then
+                let early := json.bind fun j => (j.getObjValAs? Bool "early").toOption
+                unless stringField "olean" == some path.toString &&
+                    stringField "module" == some setup.name.toString && early == some true do
+                  throw <| IO.userError "invalid Lean EOI readiness message"
+                onInterfaceReady path
+                notified := true
+          else
+            if let some msg := json.bind (fun j => (fromJson? j : Except String SerialMessage).toOption) then
+              if msg.severity == .error then errors := true
+            stdout := stdout ++ line
+        let exitCode ← child.wait
+        let stderr ← match ← IO.wait stderrTask with
+          | .ok text => pure text
+          | .error e => throw e
+        pure { stdout, stderr, exitCode }
+      catch e =>
+        child.kill
+        discard child.wait
+        throw e
+    pure (← readOutput)
+  else rawProc spawnArgs
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do

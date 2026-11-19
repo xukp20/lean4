@@ -307,7 +307,7 @@ and log are saved to `traceFile`, if the build completes without a fatal error
 @[specialize] public def buildAction
   [ToOutputJson α]
   (depTrace : BuildTrace) (traceFile : FilePath) (build : JobM α)
-  (action : JobAction := .build)
+  (action : JobAction := .build) (refreshTrace := false)
 : JobM α := do
   updateAction action
   let noBuildTraceFile := traceFile.addExtension "nobuild"
@@ -322,6 +322,7 @@ and log are saved to `traceFile`, if the build completes without a fatal error
       let iniPos ← getLogPos
       let a ← build -- fatal errors will abort here
       let log := (← getLog).takeFrom iniPos
+      let depTrace ← if refreshTrace then getTrace else pure depTrace
       writeBuildTrace traceFile depTrace (toOutputJson a) log
       removeFileIfExists noBuildTraceFile
       return a
