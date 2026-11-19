@@ -10,6 +10,7 @@ public import Lake.Config.FacetConfig
 public import Lake.Build.Job.Monad
 public import Lake.Build.Infos
 import Lean.Elab.ParseImportsFast
+import Lean.Compiler.Options
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
@@ -236,6 +237,11 @@ def computeModuleDeps
     plugins := plugins.insertIdx 0 (← getLakeInstall).sharedDynlib
   return {dynlibs, plugins}
 
+def Module.useEOI (mod : Module) : FetchM Bool := do
+  unless (← getBuildConfig).eoiEarlyOleanPackages.contains mod.pkg.baseName do return false
+  let extra := (← getLeanOptOverrides).find? mod.pkg.baseName |>.getD {}
+  return !Lean.Compiler.compiler.postponeCompile.get (mod.leanOptions ++ extra).toOptions
+
 structure TransImportEntry where
   mod : Module
   /-- Whether to include all module artifacts and traverse the module's direct imports. -/
@@ -278,7 +284,8 @@ where
       let metaVisited := if needsMeta then metaVisited.insert mod.name else metaVisited
       -- Widest level seen so far, never below an existing entry's (no demotion).
       let wantAll := allVisited.contains mod.name || existing?.any (·.oleanPrivate?.isSome)
-      let info ← (← mod.exportInfo.fetch).await
+      let useEarly ← if !wantAll && !needsMeta && !nonModule then mod.useEOI else pure false
+      let info ← (← if useEarly then mod.earlyExportInfo.fetch else mod.exportInfo.fetch).await
       let s := s.insert mod.name (if wantAll then info.allArts else info.arts)
       let input ← (← mod.input.fetch).await
       -- `import all`/`meta import` are transitive. Propagate both flags to children.
@@ -394,6 +401,21 @@ def ModuleImportInfo.addImport
   else
     info
 
+def ModuleImportInfo.addEarlyImport
+    (info : ModuleImportInfo) (imp : Import) (exp : ModuleExportInfo) : ModuleImportInfo :=
+  let info := { info with
+    directArts := if info.directArts.contains imp.module then info.directArts else
+      info.directArts.insert imp.module exp.arts
+    trace := info.trace.mix exp.transTrace |>.mix exp.artsTrace.withoutInputs }
+  if imp.isExported then
+    { info with
+      transTrace := info.transTrace
+        |>.mix exp.transTrace
+        |>.mix exp.artsTrace.withoutInputs
+        |>.withoutInputs
+    }
+  else info
+
 def Package.discriminant (self : Package) :=
   if self.version == {} then
     self.prettyName
@@ -403,7 +425,7 @@ def Package.discriminant (self : Package) :=
 set_option linter.unusedVariables.funArgs false in
 def fetchImportInfo
   (fileName : String) (pkgName modName : Name) (header : ModuleHeader)
-  (allowNonModules : Bool := false)
+  (allowNonModules : Bool := false) (early := false)
 : FetchM (Job ModuleImportInfo) := do
   let nonModule := !header.isModule
   let info := ModuleImportInfo.nil modName
@@ -432,8 +454,11 @@ def fetchImportInfo
       --   logError s!"{fileName}: cannot `import all` \
       --     the module `{imp.module}` from the package `{mod.pkg.discriminant}`"
       --   return .error
-      let importJob ← mod.exportInfo.fetch
-      return s.zipWith (sync := true) (·.addImport nonModule imp ·) importJob
+      let useEarly ← if early && !nonModule && !imp.isMeta && !imp.importAll then
+        mod.useEOI else pure false
+      let importJob ← if useEarly then mod.earlyExportInfo.fetch else mod.exportInfo.fetch
+      return s.zipWith (sync := true) (fun info exp =>
+        if useEarly then info.addEarlyImport imp exp else info.addImport nonModule imp exp) importJob
     else
       -- Remark: We've decided to disable this check for now
       -- let isImportable (mod) :=
@@ -476,6 +501,47 @@ public def Module.importInfoFacetConfig : ModuleFacetConfig importInfoFacet :=
     fetchImportInfo mod.relLeanFile.toString mod.pkg.keyName mod.name header
       (allowNonModules := mod.allowNonModules)
 
+public def Module.earlyImportInfoFacetConfig : ModuleFacetConfig earlyImportInfoFacet :=
+  mkFacetJobConfig fun mod => do
+    let header ← (← mod.header.fetch).await
+    fetchImportInfo mod.relLeanFile.toString mod.pkg.keyName mod.name header
+      (allowNonModules := mod.allowNonModules) (early := true)
+
+public def Module.eoiOLeanFacetConfig : ModuleFacetConfig eoiOLeanFacet :=
+  mkFacetJobConfig fun mod => do
+    let some interfaces := (← getBuildContext).eoiInterfaces?
+      | return ← (← mod.leanArts.fetch).mapM (sync := true) fun arts => pure arts.olean
+    let promise ← IO.Promise.new
+    let key := mod.pkg.keyName ++ mod.name
+    interfaces.modify (·.insert key promise)
+    let full ← mod.leanArts.fetch
+    BaseIO.chainTask (sync := true) full.task fun result =>
+      promise.resolve <| match result with
+        | .ok arts state => .ok arts.olean state
+        | .error e state => .error e state
+    return Job.ofTask (promise.resultD (.error 0 {}))
+
+public def Module.earlyExportInfoFacetConfig : ModuleFacetConfig earlyExportInfoFacet :=
+  mkFacetJobConfig fun mod => do
+    let input ← (← mod.input.fetch).await
+    unless input.header.isModule && (← mod.useEOI) do return ← mod.exportInfo.fetch
+    let imports ← mod.earlyImportInfo.fetch
+    let interface ← mod.eoiOLean.fetch
+    imports.bindM (sync := true) fun imports => do
+      interface.mapM (sync := true) fun olean => do
+        return {
+          srcTrace := input.trace
+          arts := .ofArrays #[#[olean.path, mod.oleanServerFile], #[mod.irSigFile, mod.irFile]]
+          artsTrace := (BuildTrace.nil s!"{mod.name}:importArts").mix olean.trace
+          transTrace := imports.transTrace
+          metaArtsTrace := .nil
+          allArts := default
+          allArtsTrace := .nil
+          metaTransTrace := .nil
+          allTransTrace := .nil
+          legacyTransTrace := .nil
+        }
+
 def noServerOLeanError :=
   "No server olean generated. Ensure the module system is enabled."
 
@@ -494,6 +560,9 @@ def Module.computeExportInfo (mod : Module) : FetchM (Job ModuleExportInfo) := d
     let metaArtsTrace := BuildTrace.nil s!"{mod.name}:importArts (meta)"
     let allArtsTrace := BuildTrace.nil s!"{mod.name}:importAllArts"
     let olean := arts.olean
+    let mixAxioms (trace : BuildTrace) := match arts.oleanAxioms? with
+      | some axioms => trace.mix axioms.trace
+      | none => trace
     if input.header.isModule then
       let some oleanServer := arts.oleanServer?
         | error noServerOLeanError
@@ -508,11 +577,11 @@ def Module.computeExportInfo (mod : Module) : FetchM (Job ModuleExportInfo) := d
         -- NOTE: always includes `.server` and full `.ir` as this data is used by the server and we
         -- do not distinguish between it and cmdline build here (TODO: this is too dangerous!)
         arts := .ofArrays #[#[olean.path, oleanServer.path], #[irSig.path, ir.path]]
-        artsTrace := artsTrace.mix olean.trace
-        metaArtsTrace := metaArtsTrace.mix olean.trace |>.mix irSig.trace |>.mix ir.trace
+        artsTrace := mixAxioms (artsTrace.mix olean.trace)
+        metaArtsTrace := mixAxioms (metaArtsTrace.mix olean.trace |>.mix irSig.trace |>.mix ir.trace)
         allArts := .ofArrays #[#[olean.path, oleanServer.path, oleanPrivate.path], #[irSig.path, ir.path]]
-        allArtsTrace := allArtsTrace.mix
-          olean.trace |>.mix oleanServer.trace |>.mix oleanPrivate.trace |>.mix irSig.trace |>.mix ir.trace
+        allArtsTrace := mixAxioms (allArtsTrace.mix
+          olean.trace |>.mix oleanServer.trace |>.mix oleanPrivate.trace |>.mix irSig.trace |>.mix ir.trace)
         transTrace := importInfo.transTrace
         metaTransTrace := importInfo.metaTransTrace
         allTransTrace := importInfo.allTransTrace
@@ -554,7 +623,7 @@ Recursively build a module's dependencies, including:
 * Shared libraries (e.g., `extern_lib` targets or precompiled modules)
 * `extraDepTargets` of its library
 -/
-def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensureJob do
+def Module.recFetchPreSetup (mod : Module) (early := true) : FetchM (Job ModulePreSetup) := ensureJob do
   /-
   Remark: Await extra target dependencies (e.g., cloud releases, `needs`) before any
   other module processing. This both enables the dependencies to effect these elements
@@ -574,7 +643,9 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
   precompiled imports so that errors in the import block of transitive imports
   will not kill this job before the direct imports are built.
   -/
-  let impInfoJob ← mod.importInfo.fetch
+  let useEarly ← if early then mod.useEOI else pure false
+  let impInfoJob ← if useEarly && (← inputJob.await).header.isModule then
+    mod.earlyImportInfo.fetch else mod.importInfo.fetch
 
   /-
   Remark: It should be possible to avoid transitive imports here when the module
@@ -640,7 +711,10 @@ where
 
 /-- The `ModuleFacetConfig` for the builtin `presetupFacet`. -/
 public def Module.presetupFacetConfig : ModuleFacetConfig presetupFacet :=
-  mkFacetJobConfig (buildable := false) recFetchPreSetup
+  mkFacetJobConfig (buildable := false) fun mod => mod.recFetchPreSetup
+
+public def Module.fullPresetupFacetConfig : ModuleFacetConfig fullPresetupFacet :=
+  mkFacetJobConfig (buildable := false) fun mod => mod.recFetchPreSetup (early := false)
 
 /-- The `ModuleFacetConfig` for the builtin `depTraceFacet`. -/
 public def Module.depTraceFacetConfig : ModuleFacetConfig depTraceFacet :=
@@ -684,6 +758,8 @@ public def Module.setupFacetConfig : ModuleFacetConfig setupFacet :=
 public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
   try
     removeFileIfExists mod.ltarFile
+    removeFileIfExists (mod.oleanFile.addExtension "axioms")
+    removeFileIfExists (mod.oleanFile.addExtension "eoi")
     removeFileIfExists mod.oleanFile
     removeFileIfExists mod.oleanServerFile
     removeFileIfExists mod.oleanPrivateFile
@@ -699,6 +775,7 @@ public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
 public def Module.clearOutputHashes (mod : Module) : IO PUnit := do
   try
     clearFileHash mod.ltarFile
+    clearFileHash (mod.oleanFile.addExtension "axioms")
     clearFileHash mod.oleanFile
     clearFileHash mod.oleanServerFile
     clearFileHash mod.oleanPrivateFile
@@ -736,6 +813,7 @@ def ModuleOutputDescrs.resolve
     olean := ← resolve descrs.olean
     oleanServer? := ← descrs.oleanServer?.mapM resolve
     oleanPrivate? := ← descrs.oleanPrivate?.mapM resolve
+    oleanAxioms? := ← descrs.oleanAxioms?.mapM resolve
     irSig? := ← descrs.irSig?.mapM resolve
     ir? := ← descrs.ir?.mapM resolve
     ilean := ← resolve descrs.ilean
@@ -789,11 +867,18 @@ instance : ResolveOutputs ModuleOutputs := ⟨resolveModuleOutputs⟩
 def Module.cacheOutputArtifacts
   (mod : Module)  (isModule : Bool) (useLocalFile : Bool)
 : JobM ModuleOutputArtifacts := do
+  let hasAxioms ← (mod.oleanFile.addExtension "axioms").pathExists
+  let cache file ext :=
+    cacheArtifact file ext (useLocalFile := useLocalFile || hasAxioms)
+  let cacheIf? c file ext := do
+    if c then return some (← cache file ext) else return none
   return {
     isModule
     olean := ← cache mod.oleanFile "olean"
     oleanServer? := ← cacheIf? isModule mod.oleanServerFile "olean.server"
     oleanPrivate? := ← cacheIf? isModule mod.oleanPrivateFile "olean.private"
+    oleanAxioms? := ← cacheIf? (← (mod.oleanFile.addExtension "axioms").pathExists)
+      (mod.oleanFile.addExtension "axioms") "olean.axioms"
     irSig? := ← cacheIf? isModule mod.irSigFile "ir.sig"
     ir? := ← cacheIf? isModule mod.irFile "ir"
     ilean := ← cache mod.ileanFile "ilean"
@@ -801,12 +886,6 @@ def Module.cacheOutputArtifacts
     bc? := ← cacheIf? (Lean.Internal.hasLLVMBackend ()) mod.bcFile "bc"
     ltar? := ← cacheIf? (← mod.ltarFile.pathExists) mod.ltarFile "ltar"
   }
-where
-  @[inline] cache file ext := do
-    -- `text` is always `false` because Lean produces LF-only `.ir` and `.c`
-    cacheArtifact file ext (useLocalFile := useLocalFile)
-  @[inline] cacheIf? c art ext := do
-    if c then return some (← cache art ext) else return none
 
 /--
 Some module build artifacts must be located in the build directory (e.g., ILeans).
@@ -814,6 +893,12 @@ This copies the required artifacts from the local Lake cache to the build direct
 updates the data structure with the new paths.
 -/
 def Module.restoreNeededArtifacts (mod : Module) (cached : ModuleOutputArtifacts) : JobM ModuleOutputArtifacts := do
+  let cached ← if cached.oleanAxioms?.isSome then
+    pure { cached with
+      olean := ← restoreArtifact mod.oleanFile cached.olean
+      oleanPrivate? := ← cached.oleanPrivate?.mapM (restoreArtifact mod.oleanPrivateFile ·)
+      oleanAxioms? := ← cached.oleanAxioms?.mapM (restoreArtifact (mod.oleanFile.addExtension "axioms") ·) }
+  else pure cached
   return {cached with
     ilean := ← restoreArtifact mod.ileanFile cached.ilean
   }
@@ -823,6 +908,7 @@ def Module.restoreAllArtifacts (mod : Module) (cached : ModuleOutputArtifacts) :
     olean := ← restoreArtifact mod.oleanFile cached.olean
     oleanServer? := ← restoreSome mod.oleanServerFile cached.oleanServer?
     oleanPrivate? := ← restoreSome mod.oleanPrivateFile cached.oleanPrivate?
+    oleanAxioms? := ← restoreSome (mod.oleanFile.addExtension "axioms") cached.oleanAxioms?
     ilean := ← restoreArtifact mod.ileanFile cached.ilean
     irSig? := ← restoreSome mod.irSigFile cached.irSig?
     ir? := ← restoreSome mod.irFile cached.ir?
@@ -833,8 +919,10 @@ def Module.restoreAllArtifacts (mod : Module) (cached : ModuleOutputArtifacts) :
 where
   @[inline] restoreSome file art? := art?.mapM (restoreArtifact file ·)
 
-public def Module.checkArtifactsExist (self : Module) (isModule : Bool) : BaseIO Bool := do
+public def Module.checkArtifactsExist (self : Module) (isModule : Bool)
+    (requiresAxioms := false) : BaseIO Bool := do
   unless (← self.oleanFile.pathExists) do return false
+  if requiresAxioms && !(← (self.oleanFile.addExtension "axioms").pathExists) then return false
   unless (← self.ileanFile.pathExists) do return false
   unless (← self.cFile.pathExists) do return false
   if Lean.Internal.hasLLVMBackend () then
@@ -880,6 +968,7 @@ def ModuleOutputArtifacts.setMTime (self : ModuleOutputArtifacts) (mtime : MTime
     olean := {self.olean with mtime}
     oleanServer? := self.oleanServer?.map ({· with mtime})
     oleanPrivate? := self.oleanPrivate?.map ({· with mtime})
+    oleanAxioms? := self.oleanAxioms?.map ({· with mtime})
     ilean := {self.ilean with mtime}
     irSig? := self.irSig?.map ({· with mtime})
     ir? := self.ir?.map ({· with mtime})
@@ -904,6 +993,8 @@ def Module.computeArtifacts (mod : Module) (isModule : Bool) : FetchM ModuleOutp
     olean := ← compute mod.oleanFile "olean"
     oleanServer? := ← computeIf isModule mod.oleanServerFile "olean.server"
     oleanPrivate? := ← computeIf isModule mod.oleanPrivateFile "olean.private"
+    oleanAxioms? := ← computeIf (← (mod.oleanFile.addExtension "axioms").pathExists)
+      (mod.oleanFile.addExtension "axioms") "olean.axioms"
     ilean := ← compute mod.ileanFile "ilean"
     irSig? := ← computeIf isModule mod.irSigFile "ir.sig"
     ir? := ← computeIf isModule mod.irFile "ir"
@@ -921,7 +1012,7 @@ instance : ToOutputJson ModuleOutputArtifacts := ⟨(toJson ·.descrs)⟩
 
 def Module.packLtar (self : Module) (arts : ModuleOutputArtifacts) : JobM Artifact := do
   let arts ← id do
-    if (← self.checkArtifactsExist arts.isModule) then
+    if (← self.checkArtifactsExist arts.isModule (requiresAxioms := arts.oleanAxioms?.isSome)) then
       return arts
     else self.restoreAllArtifacts arts
   let args ← id do
@@ -941,6 +1032,8 @@ def Module.packLtar (self : Module) (arts : ModuleOutputArtifacts) : JobM Artifa
     if let some art := arts.oleanServer? then
       args := addArt args "0" art
     if let some art := arts.oleanPrivate? then
+      args := addArt args "0" art
+    if let some art := arts.oleanAxioms? then
       args := addArt args "0" art
     args := addArt args "0" arts.ilean
     if let some art := arts.irSig? then
@@ -990,18 +1083,58 @@ def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
 public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   mkFacetJobConfig recBuildLtar
 
+def Module.awaitEOIUpstreams (mod : Module) : JobM Unit := do
+  unless (← mod.useEOI) do return
+  let input ← (← mod.input.fetch).await
+  let mut jobs := #[]
+  for imp in input.imports do
+    if let some upstream := imp.module? then
+      jobs := jobs.push (← upstream.leanArts.fetch)
+  let upstreams := Job.collectArray jobs
+  match ← upstreams.wait with
+  | .ok .. => pure ()
+  | .error .. =>
+    mod.clearOutputArtifacts
+    mod.clearOutputHashes
+    removeFileIfExists mod.traceFile
+    Job.cancelJob
+
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup)
-: JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
-  let args := mod.weakLeanArgs ++ mod.leanArgs
-  let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
-  let setup ← mkModuleSetup mod presetup
-  let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
-  mod.clearOutputArtifacts
-  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
-    (← getLeanPath) (← getLean) (← getLeanir)
-  mod.clearOutputHashes
-  mod.computeArtifacts setup.isModule
+: JobM ModuleOutputArtifacts := do
+  try
+    buildAction (refreshTrace := (← mod.useEOI)) (← getTrace) mod.traceFile do
+      let args := mod.weakLeanArgs ++ mod.leanArgs
+      let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
+      let setup ← mkModuleSetup mod presetup
+      let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
+      mod.clearOutputArtifacts
+      let interfaces? := (← getBuildContext).eoiInterfaces?
+      let eoiLeaf ← match interfaces? with
+        | some interfaces => pure (!(← interfaces.get).contains (mod.pkg.keyName ++ mod.name))
+        | none => pure false
+      compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
+        (← getLeanPath) (← getLean) (← getLeanir)
+        (eoiEarlyOlean := (← mod.useEOI))
+        (eoiLeaf := eoiLeaf)
+        (onInterfaceReady := fun path => do
+          let hash ← computeBinFileHash path
+          let artifact : Artifact := { path, hash, ext := "olean", mtime := ← getMTime path }
+          if let some interfaces := interfaces? then
+            if let some promise := (← interfaces.get).find? (mod.pkg.keyName ++ mod.name) then
+              promise.resolve (.ok artifact {}))
+      mod.awaitEOIUpstreams
+      if ← mod.useEOI then
+        let finalSetup ← (← mod.fullPresetup.fetch).await
+        setTrace finalSetup.trace
+      mod.clearOutputHashes
+      mod.computeArtifacts setup.isModule
+  catch e =>
+    if ← mod.useEOI then
+      mod.clearOutputArtifacts
+      mod.clearOutputHashes
+      removeFileIfExists mod.traceFile
+    throw e
 
 /--
 Recursively build a Lean module.
@@ -1017,16 +1150,52 @@ def Module.recBuildLean (mod : Module) : FetchM (Job ModuleOutputArtifacts) := d
   withRegisterJob mod.name.toString do
   let presetupJob ← mod.presetup.fetch
   presetupJob.mapM fun presetup => do
+    let mut pendingUpstream := false
+    if ← mod.useEOI then
+      for imp in presetup.directImports do
+        if let some upstream := imp.module? then
+          let full ← upstream.leanArts.fetch
+          unless ← IO.hasFinished full.task do pendingUpstream := true
+    let presetup ← if (← mod.useEOI) && !pendingUpstream then
+      (← mod.fullPresetup.fetch).await
+    else pure presetup
     setTrace presetup.trace
-    let arts ← fetchCore presetup
-    let arts ← trackOutputsIfEnabled arts
-    let arts ← adjustMTime arts
-    return arts
+    let cleanupHandle ← if (← mod.useEOI) then
+      let files := #[mod.oleanFile, mod.oleanServerFile, mod.oleanPrivateFile, mod.ileanFile,
+        mod.irSigFile, mod.irFile, mod.cFile, mod.bcFile, mod.traceFile, mod.ltarFile,
+        mod.oleanFile.addExtension "axioms", mod.oleanFile.addExtension "eoi"]
+      Lean.registerEOIFiles <| (files ++ files.map (·.addExtension "hash")).map (·.toString)
+    else pure 0
+    try
+      let arts ← if pendingUpstream then do
+        let arts ← mod.buildLean presetup
+        if (← mod.pkg.isArtifactCacheWritable) then
+          let inputHash := (← getTrace).hash
+          let restore ← mod.pkg.restoreAllArtifacts
+          let arts ← mod.cacheOutputArtifacts presetup.isModule restore
+          (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs
+          pure arts
+        else
+          pure arts
+      else
+        fetchCore presetup
+      mod.awaitEOIUpstreams
+      let arts ← trackOutputsIfEnabled arts
+      let arts ← adjustMTime arts
+      if cleanupHandle != 0 then Lean.finishEOIFiles cleanupHandle
+      return arts
+    catch e =>
+      if cleanupHandle != 0 then Lean.finishEOIFiles cleanupHandle (abort := true)
+      throw e
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM (ModuleOutputArtifacts ⊕ SavedTrace) := do
     let inputHash := (← getTrace).hash
+    -- `getArtifactsUsingTrace?` can publish a missing cache mapping even on a warm hit.
+    if let .ok data := savedTrace then
+      if data.depHash == inputHash && data.outputs?.isSome then mod.awaitEOIUpstreams
     let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
       | return .inr savedTrace
+    mod.awaitEOIUpstreams
     match (ltarOrArts : ModuleOutputs) with
     | .ltar ltar =>
       updateAction .unpack
@@ -1065,6 +1234,9 @@ where
     have : GetMTime Module := ⟨Module.getMTime (isModule := presetup.isModule)⟩
     have : CheckExists Module := ⟨Module.checkExists (isModule := presetup.isModule)⟩
     let savedTrace ← readTraceFile mod.traceFile
+    let requiresAxioms := match savedTrace with
+      | .ok data => data.outputs?.any (fun out => (out.getObjVal? "ax").isOk)
+      | _ => false
     if (← mod.pkg.isArtifactCacheWritable) then
       let restore ← mod.pkg.restoreAllArtifacts
       match (← fetchFromCache? presetup savedTrace restore) with
@@ -1073,7 +1245,8 @@ where
       | .inr savedTrace =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
         if status.isUpToDate then
-          unless (← mod.checkArtifactsExist presetup.isModule) do
+          mod.awaitEOIUpstreams
+          unless (← mod.checkArtifactsExist presetup.isModule (requiresAxioms := requiresAxioms)) do
             -- Restoring from the archive stamps the trace with the current input
             -- hash, so only do it on a verified hash match; an mtime-only match
             -- leaves the hash unconfirmed, so rebuild instead.
@@ -1092,7 +1265,8 @@ where
     else
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
-        unless (← mod.checkArtifactsExist presetup.isModule) do
+        mod.awaitEOIUpstreams
+        unless (← mod.checkArtifactsExist presetup.isModule (requiresAxioms := requiresAxioms)) do
           -- As above: restore only on a verified hash match; an mtime-only match
           -- rebuilds instead.
           if status == .hashUpToDate then
@@ -1397,6 +1571,10 @@ public def Module.initFacetConfigs : DNameMap ModuleFacetConfig :=
   |>.insert importArtsFacet importArtsFacetConfig
   |>.insert importAllArtsFacet importAllArtsFacetConfig
   |>.insert exportInfoFacet exportInfoFacetConfig
+  |>.insert fullPresetupFacet fullPresetupFacetConfig
+  |>.insert earlyImportInfoFacet earlyImportInfoFacetConfig
+  |>.insert earlyExportInfoFacet earlyExportInfoFacetConfig
+  |>.insert eoiOLeanFacet eoiOLeanFacetConfig
   |>.insert ltarFacet ltarFacetConfig
   |>.insert oleanFacet oleanFacetConfig
   |>.insert oleanServerFacet oleanServerFacetConfig

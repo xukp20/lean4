@@ -743,28 +743,56 @@ private def compileDeclsImpl (declNames : Array Name) : CoreM Unit := do
 -- `ref?` is used for error reporting if available
 def compileDecls (decls : Array Name) (logErrors := true) : CoreM Unit := do
   let env ← getEnv
+  let markNoncomputable := decls.forM fun decl => modifyEnv (addNoncomputable · decl)
   if !Elab.async.get (← getOptions) then
-    let _ ← traceBlock "compiler env" (← getEnv).checked
-    doCompile
+    let _ ← traceBlock "compiler env" env.checked
+    doCompile markNoncomputable
     return
-  let env ← getEnv
   let res ← env.promiseChecked
   setEnv res.mainEnv
   let cancelTk ← IO.CancelToken.new
-  let checkAct ← Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun _ => do
-    setEnv res.asyncEnv
-    try
-      doCompile
-    finally
-      res.commitChecked (← getEnv)
-  let t ← BaseIO.mapTask checkAct env.checked
+  let t ← if let some compilerState := env.eoiCompilerState? then
+    let compilerState := env.syncEOICompilerSignatures compilerState
+    let deltaRef ← IO.mkRef (default : EOICompilerResult)
+    let noncompRef ← IO.mkRef (#[] : Array Name)
+    let compileAct ← Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun previous => do
+      let initial := res.asyncEnv.eoiCompilerView compilerState.sigKEnv previous
+      let initial := previous.noncompDecls.foldl addNoncomputable initial
+      setEnv initial
+      try
+        doCompile (noncompRef.set decls)
+      finally
+        deltaRef.set <| initial.eoiCompilerDelta (← getEnv) (← noncompRef.get)
+    let compiled ← BaseIO.mapTask (t := compilerState.task) fun previous => do
+      let snap ← compileAct previous
+      let delta ← deltaRef.get
+      let state := { delta with
+        modifiedIdxs := previous.modifiedIdxs ++ delta.modifiedIdxs.filter (!previous.modifiedIdxs.contains ·)
+        noncompDecls := previous.noncompDecls ++ delta.noncompDecls
+      }
+      return (snap, delta, state)
+    modifyEnv (·.withEOICompilerState { compilerState with task := compiled.map (·.2.2) (sync := true) })
+    -- Preserve the checked-environment promise consumed by #eval and final serialization.
+    let _ ← BaseIO.bindTask (t := compiled) (sync := true) fun (_, delta, _) =>
+      BaseIO.mapTask (t := env.checked) (sync := true) fun _ => do
+        let merged := res.asyncEnv.mergeEOICompilerDelta delta
+        res.commitChecked (delta.noncompDecls.foldl addNoncomputable merged)
+    pure <| compiled.map (·.1) (sync := true)
+  else
+    let checkAct ← Core.wrapAsyncAsSnapshot (cancelTk? := cancelTk) fun _ => do
+      setEnv res.asyncEnv
+      try
+        doCompile markNoncomputable
+      finally
+        res.commitChecked (← getEnv)
+    BaseIO.mapTask checkAct env.checked
   -- Do not display reporting range; most uses of `addDecl` are for registering auxiliary decls
   -- users should not worry about and other callers can add a separate task with ranges
   -- themselves, see `MutualDef`.
   Core.logSnapshotTask { stx? := none, reportingRange := .skip, task := t, cancelTk? := cancelTk }
-where doCompile := do
-  -- don't compile if kernel errored; should be converted into a task dependency when compilation
-  -- is made async as well
+where doCompile (markNoncomputable : CoreM Unit) : CoreM Unit := do
+  -- The checked path omits declarations that failed kernel checking. The signature path
+  -- only supplies codegen input, and publication still requires the complete kernel checks.
   if !decls.all (← getEnv).constants.contains then
     return
   withoutExporting do
@@ -773,8 +801,7 @@ where doCompile := do
       compileDeclsImpl decls
     catch e =>
       state.restore
-      for decl in decls do
-        modifyEnv (addNoncomputable · decl)
+      markNoncomputable
       if logErrors then
         throw e
 

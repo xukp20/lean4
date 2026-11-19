@@ -388,7 +388,7 @@ General notes:
 -/
 partial def process
     (setupImports : HeaderSyntax → ProcessingT IO (Except HeaderProcessedSnapshot SetupImportsResult))
-    (old? : Option InitialSnapshot) : ProcessingM InitialSnapshot := do
+    (old? : Option InitialSnapshot) (moduleJobConfig : ModuleJobConfig := {}) : ProcessingM InitialSnapshot := do
   parseHeader old? |>.run (old?.map (·.ictx))
 where
   parseHeader (old? : Option HeaderParsedSnapshot) : LeanProcessingM HeaderParsedSnapshot := do
@@ -503,6 +503,7 @@ where
         stx.startPos setup.imports setup.isModule setup.opts .empty ctx.toInputContext
         setup.trustLevel setup.plugins setup.mainModuleName setup.package? setup.importArts
         (headerStx? := stx) (origHeaderStx? := origStx)
+      let headerEnv ← headerEnv.withModuleJobConfig moduleJobConfig
       let stopTime := (← IO.monoNanosNow).toFloat / 1000000000
       let diagnostics := (← Snapshot.Diagnostics.ofMessageLog msgLog)
       if msgLog.hasErrors then

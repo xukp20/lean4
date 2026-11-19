@@ -12,6 +12,7 @@ public import Init.System.Promise
 public import Init.System.CancelToken
 public import Lean.Data.NameTrie
 public import Lean.Setup
+public import Lean.ModuleJobConfig
 public import Lean.LocalContext
 public import Lean.Util.Path
 public import Lean.Util.FindExpr
@@ -411,6 +412,25 @@ private structure AsyncContext where mkRaw ::
   realizingStack : List Name
 deriving Nonempty
 
+/-- Shared state for the provisional interface and asynchronous realization boundary. -/
+structure EOIExportState where
+  /-- Once set, a new public non-theorem realization invalidates the interface. -/
+  sealed : Bool := false
+  fallback : Bool := false
+  privateRealizations : Nat := 0
+  suppressed : Nat := 0
+  suppressedNames : NameSet := {}
+  escaped : Array Name := #[]
+  deriving Inhabited
+
+/-- Register unverified outputs for cleanup on command-line interruption or process exit. -/
+@[extern "lean_eoi_register_files"]
+opaque registerEOIFiles (paths : Array String) : BaseIO UInt64
+
+/-- Release a provisional output registration, optionally deleting its files. -/
+@[extern "lean_eoi_finish_files"]
+opaque finishEOIFiles (handle : UInt64) (abort := false) : BaseIO Unit
+
 /--
 Checks whether a declaration named `n` may be added to the environment in the given context. See
 also `AsyncContext.declPrefix`.
@@ -678,10 +698,6 @@ def importEnv? (env : Environment) : Option Environment :=
   -- safety: `RealizationContext` is private
   unsafe env.importRealizationCtx?.map (unsafeCast (β := Environment) ·.env)
 
-/-- Forgets about the asynchronous context restrictions. Used only for `withoutModifyingEnv`. -/
-def unlockAsync (env : Environment) : Environment :=
-  { env with asyncCtx? := none }
-
 @[extern "lean_elab_add_decl"]
 private opaque addDeclCheck (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize)
   (decl : @& Declaration) (cancelTk? : @& Option IO.CancelToken) : Except Kernel.Exception Environment
@@ -841,12 +857,6 @@ def find? (env : Environment) (n : Name) (skipRealize := false) : Option Constan
   if let some c := env.base.get env |>.constants.map₁[n]? then
     return c
   env.findAsyncCore? n (skipRealize := skipRealize) |>.map (·.toConstantInfo)
-
-/-- Checks if, in the public scope (`Environment.isExporting`), the given name refers to a
-definition with a visible body, i.e. `ConstantInfo.hasValue`. Recall that outside the module
-system, this is any definition. -/
-def hasExposedBody (env : Environment) (n : Name) : Bool :=
-  env.setExporting true |>.find? n |>.any (·.hasValue)
 
 /--
 Allows `realizeConst` calls for the given declaration in all derived environment branches.
@@ -1152,6 +1162,11 @@ not block.
 -/
 def containsOnBranch (env : Environment) (n : Name) : Bool :=
   (env.asyncConsts.find? n |>.isSome) || (env.base.get env).constants.contains n
+
+/-- Checks whether a constant has direct asynchronous entries in both visibility scopes, without
+consulting the kernel environment or waiting for another branch. -/
+def containsAsyncOnBranch (env : Environment) (n : Name) : Bool :=
+  (env.asyncConstsMap.private.find? n).isSome && (env.asyncConstsMap.public.find? n).isSome
 
 /--
 Returns the constants added in the current module, in elaboration tree pre-order: the top-level
@@ -1526,6 +1541,277 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
   EnvExtension.envExtensionsRef.modify fun exts => exts.push (unsafe unsafeCast ext)
   pure ext
 
+/-- Extensions produced by compilation and fallback noncomputable tags. -/
+structure EOICompilerResult where
+  extensions : Array EnvExtensionState := #[]
+  modifiedIdxs : Array Nat := #[]
+  noncompDecls : Array Name := #[]
+  deriving Inhabited
+
+/-- The compiler's ordered task and the signatures already collected on this branch. -/
+structure EOICompilerState where
+  task : Task EOICompilerResult
+  sigKEnv : Kernel.Environment
+  syncedCount : Nat
+
+namespace Environment
+
+/-- The accumulated signature constants of one immutable environment branch. -/
+private builtin_initialize signatureConstsExt : EnvExtension (Option (Name × ConstMap)) ←
+  registerEnvExtension (pure none) (asyncMode := .local)
+
+private def cacheSignatureConsts (env : Environment) (signature : Kernel.Environment) : Environment :=
+  signatureConstsExt.setState env (some (env.mainModule, signature.constants))
+
+private def prependSignatureDeps (info : ConstantInfo) (pending : List Name) : List Name :=
+  let pending := info.type.foldConsts pending (· :: ·)
+  let pending := if let some value := info.value? (allowOpaque := true) then
+    value.foldConsts pending (· :: ·)
+  else pending
+  match info with
+  | .inductInfo val =>
+    let pending := val.all.foldl (fun acc n => n :: mkRecName n :: acc) (val.ctors ++ pending)
+    let recName := mkRecName (val.all.headD val.name)
+    (List.range val.numNested).foldl (fun acc i => recName.appendIndexAfter (i + 1) :: acc) pending
+  | .ctorInfo val => val.induct :: pending
+  | .recInfo val => val.rules.foldl
+      (fun acc rule => rule.rhs.foldConsts (rule.ctor :: acc) (· :: ·)) (val.all ++ pending)
+  | _ => pending
+
+/-- Extend a signature environment with the requested, already available dependencies. -/
+partial def toKernelSignature (env : Environment) (roots : List Name) (newNames : NameSet := {}) :
+    BaseIO (Option (Environment × Kernel.Environment)) := do
+  let base := env.base.private
+  let signature := match signatureConstsExt.getState env with
+    | some (mainModule, constants) =>
+      if mainModule == env.mainModule then { base with constants } else base
+    | none => base
+  let some signature ← collect (env.setExporting false) roots signature | return none
+  return some (cacheSignatureConsts env signature, signature)
+where
+  collect (env : Environment) (pending : List Name) (signature : Kernel.Environment) :
+      BaseIO (Option Kernel.Environment) := do
+    let n :: rest := pending | return some signature
+    if signature.constants.contains n || newNames.contains n then
+      return ← collect env rest signature
+    -- Only direct branch entries can be queried without waiting for nested elaboration or realizations.
+    unless env.containsOnBranch n do return none
+    let some info := env.findAsync? n (skipRealize := true) | return none
+    let cinfo ← if info.kind == .thm then
+      if ← IO.hasFinished info.sig then
+        pure <| ConstantInfo.axiomInfo { info.toConstantVal with isUnsafe := false }
+      else return none
+    else if ← IO.hasFinished info.constInfo then
+      pure info.toConstantInfo
+    else return none
+    -- Add before traversing the dependencies, since inductive families and recursors are cyclic.
+    collect env (prependSignatureDeps cinfo rest) (signature.add cinfo)
+
+private def hasInductiveNameCollision (env : Environment) (n : Name) : Bool :=
+  env.base.private.constants.contains n ||
+    (env.asyncConstsMap.private.normalizedTrie.find? (privateToUserName n)).isSome
+
+/--
+Checks an inductive against local signatures without forcing `checked`, publishes its
+constants, and leaves a promise for an ordered check in the complete environment.
+The caller must perform the complete check on `asyncEnv` and call `commitChecked` even on failure.
+-/
+def addInductiveSignature (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize)
+    (decl : Declaration) (cancelTk? : Option IO.CancelToken) :
+    BaseIO (Except Kernel.Exception PromiseCheckedResult) := do
+  if ← IO.hasFinished env.checked then
+    return .error <| .other "kernel environment is ready"
+  let names := decl.getNames
+  if let some n := names.find? (hasInductiveNameCollision env) then
+    return .error <| .alreadyDeclared env.base.private n
+  if let some ctx := env.asyncCtx? then
+    if let some n := decl.getTopLevelNames.find? (!ctx.mayContain ·) then
+      return .error <| .other s!"cannot add declaration {n} to environment as it is restricted to the \
+        prefix {ctx.declPrefix}"
+  let roots := Id.run <| decl.foldExprM (fun acc e => pure (e.foldConsts acc (· :: ·))) []
+  let some (env, signatureEnv) ← env.toKernelSignature roots (.ofList names) |
+    return .error <| .other "signature dependencies are unavailable"
+  let signatureResult := signatureEnv.addDeclCore maxHeartbeats maxRecDepth decl cancelTk?
+  match signatureResult with
+  | .error ex => return .error ex
+  | .ok checkedSignature =>
+    let mut names := names
+    if let .inductDecl _ _ (indType :: _) _ := decl then
+      let some (.inductInfo info) := checkedSignature.find? indType.name
+        | return .error <| .other "signature kernel did not return an inductive type"
+      -- The kernel names all auxiliary recursors after the first type in the mutual group.
+      let auxNames := (List.range info.numNested).map fun i =>
+        indType.name ++ `rec |>.appendIndexAfter (i + 1)
+      for n in auxNames do
+        if hasInductiveNameCollision env n then
+          return .error <| .alreadyDeclared env.base.private n
+        unless (checkedSignature.find? n).any (fun c => c matches .recInfo _) do
+          return .error <| .other s!"signature kernel did not return auxiliary recursor {n}"
+      names := names ++ auxNames
+    let mut mainEnv := env
+    for n in names do
+      let info := (checkedSignature.find? n).get!
+      mainEnv := { mainEnv with asyncConstsMap := mainEnv.asyncConstsMap.map (·.add {
+        constInfo := .ofConstantInfo info
+        exts? := none
+        aconstsImpl := .pure <| .mk (α := AsyncConsts) default
+      }) }
+    mainEnv := cacheSignatureConsts mainEnv checkedSignature
+    let res ← env.promiseChecked
+    return .ok { res with
+      mainEnv := { mainEnv with checked := res.mainEnv.checked }
+      -- The declaration may contain multiple inductive names, so a single-name async prefix is
+      -- insufficient. The original branch restriction was checked before the signature check.
+      asyncEnv := env.enterAsync .anonymous
+    }
+
+end Environment
+
+private builtin_initialize moduleJobConfigExt : EnvExtension ModuleJobConfig ←
+  registerEnvExtension (asyncMode := .local) (pure {})
+
+def Environment.moduleJobConfig (env : Environment) : ModuleJobConfig :=
+  moduleJobConfigExt.getState env
+
+def Environment.setModuleJobConfig (env : Environment) (config : ModuleJobConfig) : Environment :=
+  moduleJobConfigExt.setState env config
+
+private structure EOIRuntime where
+  inAsyncTheorem : Bool := false
+  compilerState? : Option EOICompilerState := none
+  exporting : Bool := false
+  state? : Option (IO.Ref EOIExportState) := none
+  moduleFiles : Array System.FilePath := #[]
+  deriving Inhabited
+
+private builtin_initialize eoiRuntimeExt : EnvExtension EOIRuntime ←
+  registerEnvExtension (asyncMode := .local) (pure {})
+
+namespace Environment
+
+private def inEOITheorem (env : Environment) : Bool :=
+  env.asyncCtx?.isSome && (eoiRuntimeExt.getState (asyncMode := .local) env).inAsyncTheorem
+
+def enterAsyncTheorem (env : Environment) : Environment :=
+  if env.asyncCtx?.isSome && env.moduleJobConfig.eoiEarlyOlean then
+    eoiRuntimeExt.modifyState (asyncMode := .local) env ({ · with inAsyncTheorem := true })
+  else env
+
+/-- Forgets about the asynchronous context restrictions. Used only for `withoutModifyingEnv`. -/
+def unlockAsync (env : Environment) : Environment :=
+  let env := if env.inEOITheorem then
+    eoiRuntimeExt.modifyState (asyncMode := .local) env ({ · with inAsyncTheorem := false })
+  else env
+  { env with asyncCtx? := none }
+
+/-- True only while computing the provisional public projection. -/
+def eoiExporting (env : Environment) : Bool :=
+  (eoiRuntimeExt.getState (asyncMode := .local) env).exporting
+
+/-- Checks whether the public scope exposes a definition body. -/
+def hasExposedBody (env : Environment) (n : Name) : Bool :=
+  env.setExporting true |>.find? n (skipRealize := env.eoiExporting) |>.any (·.hasValue)
+
+/-- Runtime bookkeeping is local and is never serialized as a module entry. -/
+def eoiState? (env : Environment) : Option (IO.Ref EOIExportState) :=
+  (eoiRuntimeExt.getState (asyncMode := .local) env).state?
+
+def withModuleJobConfig (env : Environment) (config : ModuleJobConfig) : BaseIO Environment := do
+  let env := env.setModuleJobConfig config
+  if config.eoiEarlyOlean then
+    let state ← IO.mkRef {}
+    let compilerState : EOICompilerState := {
+      task := .pure {}
+      sigKEnv := env.base.private
+      syncedCount := 0
+    }
+    return eoiRuntimeExt.modifyState env fun rt =>
+      { rt with state? := some state, compilerState? := some compilerState }
+  else
+    return env
+
+def eoiCompilerState? (env : Environment) : Option EOICompilerState :=
+  if env.asyncCtx?.isNone then (eoiRuntimeExt.getState env).compilerState? else none
+
+def withEOICompilerState (env : Environment) (state : EOICompilerState) : Environment :=
+  eoiRuntimeExt.modifyState env ({ · with compilerState? := some state })
+
+/--
+The compiler needs declaration bodies for executable code. Theorem signatures suffice because
+proofs are erased. Each top-level pass visits only the new suffix of the main branch.
+-/
+partial def syncEOICompilerSignatures (env : Environment) (state : EOICompilerState) : EOICompilerState := Id.run do
+  let aconsts := env.asyncConstsMap.private
+  let delta := aconsts.revList.take (aconsts.size - state.syncedCount)
+  let sigKEnv := delta.reverse.foldl addSignature state.sigKEnv
+  return { state with sigKEnv, syncedCount := aconsts.size }
+where
+  addSignature (kenv : Kernel.Environment) (c : AsyncConst) : Kernel.Environment := Id.run do
+    if kenv.constants.contains c.constInfo.name then return kenv
+    if c.constInfo.kind == .thm then
+      return kenv.add (.axiomInfo { c.constInfo.toConstantVal with isUnsafe := false })
+    let mut kenv := kenv.add c.constInfo.toConstantInfo
+    for child in c.aconsts.get.revList do
+      -- A nested branch inherits the parent prefix. Its newest entries precede that prefix.
+      if kenv.constants.contains child.constInfo.name then break
+      kenv := addSignature kenv child
+    return kenv
+
+private def applyEOICompilerExtensions (exts : Array EnvExtensionState) (result : EOICompilerResult) :
+    Array EnvExtensionState :=
+  result.modifiedIdxs.foldl (fun exts i => exts.set! i result.extensions[i]!) exts
+
+/-- Compile against the current local extensions and the previous compiler task's changes. -/
+def eoiCompilerView (env : Environment) (sigKEnv : Kernel.Environment)
+    (previous : EOICompilerResult) : Environment :=
+  let view := env.setCheckedSync { sigKEnv with
+    extensions := applyEOICompilerExtensions env.base.private.extensions previous
+    quotInit := env.base.private.quotInit
+  }
+  -- Main-branch realizations are already in the visible async constant maps. The global
+  -- realization task includes proof-local additions, so looking up codegen auxiliaries in it
+  -- would reintroduce a dependency on proofs unrelated to this compilation.
+  { view with allRealizations := .pure {} }
+
+/-- Record extension slots changed by this compiler invocation. -/
+def eoiCompilerDelta (before after : Environment) (noncompDecls : Array Name) : EOICompilerResult := Id.run do
+  let old := before.toKernelEnv.extensions
+  let extensions := after.toKernelEnv.extensions
+  let mut modifiedIdxs := #[]
+  unless unsafe ptrEq old extensions do
+    for i in [:extensions.size] do
+      unless unsafe ptrEq old[i]! extensions[i]! do
+        modifiedIdxs := modifiedIdxs.push i
+  return { extensions, modifiedIdxs, noncompDecls }
+
+/-- Publish just this task's changes to the ordinary checked chain. -/
+def mergeEOICompilerDelta (env : Environment) (delta : EOICompilerResult) : Environment :=
+  env.modifyCheckedAsync fun kenv =>
+    { kenv with extensions := applyEOICompilerExtensions kenv.extensions delta }
+
+/-- Overlay the complete compiler state on the local view used by export callbacks. -/
+def withEOICompilerExport (env : Environment) (result : EOICompilerResult) : Environment :=
+  { env with base.private.extensions := applyEOICompilerExtensions env.base.private.extensions result }
+
+def withEOIExporting (env : Environment) : Environment :=
+  eoiRuntimeExt.modifyState (asyncMode := .local) env ({ · with exporting := true })
+
+def withEOIStateFrom (env source : Environment) : Environment :=
+  eoiRuntimeExt.modifyState (asyncMode := .local) (env.setModuleJobConfig source.moduleJobConfig) ({ · with state? := source.eoiState?, inAsyncTheorem := source.inEOITheorem })
+
+def moduleOLeanFiles (env : Environment) : Array System.FilePath :=
+  (eoiRuntimeExt.getState (asyncMode := .local) env).moduleFiles
+
+private def setEOIModuleFiles (env : Environment) (files : Array System.FilePath) : Environment :=
+  eoiRuntimeExt.modifyState (asyncMode := .local) env ({ · with moduleFiles := files })
+
+end Environment
+
+register_builtin_option experimental.inductiveUnblock : Bool := {
+  defValue := false
+  descr := "check inductive signatures before ordered complete kernel checking"
+}
+
 private def mkInitialExtensionStates : IO (Array EnvExtensionState) := EnvExtension.mkInitialExtStates
 
 def mkEmptyEnvironment (trustLevel : UInt32 := 0) : IO Environment := do
@@ -1839,7 +2125,7 @@ private def computeExtEntries (env : Environment) :
     IO (OLeanEntries (Array (Name × Array EnvExtensionEntry))) := do
   let pExts ← persistentEnvExtensionsRef.get
   let allEntries := pExts.map fun pExt =>
-    let asyncMode := match pExt.toEnvExtension.asyncMode with
+    let asyncMode := if env.eoiExporting then .local else match pExt.toEnvExtension.asyncMode with
       | .async _ => .sync
       | m => m
     let state := pExt.getState (asyncMode := asyncMode) env
@@ -1854,6 +2140,43 @@ private def computeExtEntries (env : Environment) :
     exported := filterNonEmpty .exported
     server   := filterNonEmpty .server
     «private» := filterNonEmpty .private
+  }
+
+private partial def gatherEOIConsts (publicConsts privateConsts : AsyncConsts)
+    (cs : Array ConstantInfo) (seen : NameSet) : Array ConstantInfo × NameSet := Id.run do
+  let mut cs := cs
+  let mut seen := seen
+  for c in publicConsts.revList.reverse do
+    if seen.contains c.constInfo.name then continue
+    seen := seen.insert c.constInfo.name
+    let private? := privateConsts.find? c.constInfo.name
+    -- The complete public info is still tied to constPromise even when its kind is `axiom`.
+    if c.constInfo.kind == .axiom && private?.any (·.constInfo.kind == .thm) then
+      cs := cs.push (.axiomInfo { c.constInfo.toConstantVal with isUnsafe := false })
+      continue
+    cs := cs.push c.constInfo.toConstantInfo
+    let nestedPrivate := private?.map (·.aconsts.get) |>.getD default
+    (cs, seen) := gatherEOIConsts c.aconsts.get nestedPrivate cs seen
+  return (cs, seen)
+
+/-- Construct the public projection without forcing theorem bodies or the checked environment. -/
+def mkExportedModuleDataEOI (env : Environment) : IO ModuleData := do
+  let env := env.setExporting true |>.withEOIExporting
+  let constants := (gatherEOIConsts env.asyncConstsMap.public env.asyncConstsMap.private #[] {}).1
+    |>.qsort (fun a b => Name.quickLt a.name b.name)
+  -- Export callbacks must observe the same ready signatures as the serialized projection.
+  let publicConsts := constants.foldl (init := (default : AsyncConsts)) fun consts c =>
+    consts.add {
+      constInfo := .ofConstantInfo c
+      exts? := none
+      aconstsImpl := .pure (.mk (α := AsyncConsts) default) }
+  let env := { env with asyncConstsMap.public := publicConsts }
+  let entries ← computeExtEntries env
+  return { env.header with
+    constNames := constants.map (·.name)
+    constants
+    entries := entries.exported
+    extraConstNames := getIRExtraConstNames env .exported
   }
 
 def mkModuleData (env : Environment) (level : OLeanLevel := .private)
@@ -1885,6 +2208,25 @@ def mkModuleData (env : Environment) (level : OLeanLevel := .private)
     constNames, constants, entries
   }
 
+/-- Reject additions or changed public declarations not represented by the sealed interface. -/
+def validateEOIConstants (env : Environment) (early : ModuleData) : IO Unit := do
+  let env := env.setExporting true
+  let suppressed : NameSet ← match env.eoiState? with
+    | some ref => pure (← ref.get).suppressedNames
+    | none => pure {}
+  let expected := early.constants.foldl (init := ({} : NameMap ConstantInfo)) fun s c =>
+    s.insert c.name c
+  for c in early.constants do
+    unless env.find? c.name == some c do
+      throw <| IO.userError s!"EOI public declaration changed: '{c.name}'"
+  let names := env.checked.get.constants.foldStage2 (fun ns n _ => ns.push n) #[]
+  for n in names do
+    if !expected.contains n && !suppressed.contains n then
+      let isPublic := (env.find? n (skipRealize := true)).isSome ||
+        (!isPrivateName n && (env.find? n (skipRealize := false)).isSome)
+      if isPublic then
+        throw <| IO.userError s!"EOI public declaration escaped the sealed interface: '{n}'"
+
 set_option compiler.ignoreBorrowAnnotation true in
 @[extern "lean_ir_export_entries"]
 private opaque exportIREntries (env : Environment) : Array (Name × Array EnvExtensionEntry)
@@ -1899,15 +2241,24 @@ private def mkIRData (env : Environment) : ModuleData :=
     extraConstNames := getIRExtraConstNames env .private (includeDecls := true)
   }
 
-def writeModule (env : Environment) (fname : System.FilePath) (writeIR := true) : IO Unit := do
+def writeModule (env : Environment) (fname : System.FilePath) (writeIR := true)
+    (early? : Option (ModuleData × Compactor) := none) : IO Unit := do
   if env.header.isModule then
     let extEntries ← computeExtEntries env
     let mkPart (level : OLeanLevel) :=
       return (level.adjustFileName fname, (← mkModuleData env level extEntries))
-    saveModuleDataParts env.mainModule #[
-      (← mkPart .exported),
-      (← mkPart .server),
-      (← mkPart .private)]
+    if let some (early, compactor) := early? then
+      let mut compactor := compactor
+      for level in #[OLeanLevel.server, .private] do
+        let (path, data) ← mkPart level
+        compactor ← unsafe CompactedRegion.save path env.mainModule data #[] (some compactor)
+      -- The compactor's identity map borrows objects from the first projection.
+      Runtime.forget (early, compactor)
+    else
+      saveModuleDataParts env.mainModule #[
+        (← mkPart .exported),
+        (← mkPart .server),
+        (← mkPart .private)]
     if writeIR then
       let irData := mkIRData env
       -- Make sure to change the module name so we derive a different base address
@@ -2387,6 +2738,8 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     importRealizationCtx? := none
     serverBaseExts := (← setImportedEntries privateBase.extensions serverData)
   }
+  env := env.setEOIModuleFiles <| modules.map fun mod =>
+    mod.parts[0]?.map (·.2.filePath) |>.getD ""
   if leakEnv then
     /- Mark persistent a first time before `finalizePersistentExtensions`, which
        avoids costly MT markings when e.g. an interpreter closure (which
@@ -2712,6 +3065,10 @@ def realizeConst (env : Environment) (forConst : Name) (constName : Name)
     IO (Environment × Task (Option Kernel.Exception) × Dynamic) := do
   let res ← env.realizeValue forConst { constName : RealizeConstKey } fun realizeEnv realizeOpts => do
     -- ensure that environment extension modifications know they are in an async context
+    let realizeEnv := realizeEnv.withEOIStateFrom env
+    let realizeEnv := if env.inEOITheorem then
+      { realizeEnv with asyncCtx? := env.asyncCtx? }
+    else realizeEnv
     let realizeEnv := realizeEnv.enterAsyncRealizing constName
     -- skip kernel in `realize`, we'll re-typecheck anyway
     let realizeOpts := debug.skipKernelTC.set realizeOpts true
@@ -2756,6 +3113,29 @@ def realizeConst (env : Environment) (forConst : Name) (constName : Name)
     }
     pure (.mk res)
   let some res := res.get? RealizeConstResult | unreachable!
+  if env.inEOITheorem then
+    if let some state := env.eoiState? then
+      let privateCount := res.newConsts.private.countP fun c =>
+        !res.newConsts.public.any (·.constInfo.name == c.constInfo.name)
+      state.modify fun s => { s with privateRealizations := s.privateRealizations + privateCount }
+      for c in res.newConsts.public do
+        let info := c.constInfo.toConstantInfo
+        let private? := res.newConsts.private.find? (·.constInfo.name == info.name)
+        let safeTheorem : Bool := match info, private? with
+          | .axiomInfo ax, some pc =>
+            !ax.isUnsafe && isReservedName env info.name && pc.constInfo.kind == .thm &&
+              pc.constInfo.toConstantVal == info.toConstantVal
+          | _, _ => false
+        if safeTheorem then
+          state.modify fun s => { s with
+            suppressed := s.suppressed + 1
+            suppressedNames := s.suppressedNames.insert info.name
+          }
+        else
+          let sealed ← state.modifyGet fun s =>
+            (s.sealed, { s with fallback := true, escaped := s.escaped.push info.name })
+          if sealed then
+            throw <| IO.userError s!"EOI interface invalidated by public realization '{info.name}'"
   let exPromise ← IO.Promise.new
   let env := { env with
     asyncConstsMap := {

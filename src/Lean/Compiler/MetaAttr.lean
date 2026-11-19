@@ -57,7 +57,7 @@ def isDeclMeta (env : Environment) (declName : Name) : Bool :=
       | n               => n
     match env.getModuleIdxFor? declName with
     | some idx => declMetaExt.getModuleEntries env idx |>.binSearchContains inferFor Name.quickLt
-    | none => declMetaExt.getState env |>.contains inferFor
+    | none => declMetaExt.getState (asyncMode := if env.eoiExporting then .local else .sync) env |>.contains inferFor
 
 /-- Marks a declaration to be exported for interpretation. -/
 def setDeclMeta (env : Environment) (declName : Name) : Environment :=

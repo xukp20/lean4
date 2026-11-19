@@ -13,6 +13,8 @@ Author: Leonardo de Moura
 #include <utility>
 #include <vector>
 #include <set>
+#include <atomic>
+#include <mutex>
 #include "runtime/stackinfo.h"
 #include "runtime/interrupt.h"
 #include "runtime/memory.h"
@@ -187,6 +189,7 @@ static struct option g_long_options[] = {
     {"plugin",       required_argument, 0, 'p'},
     {"load-dynlib",  required_argument, 0, 'l'},
     {"setup",        required_argument, 0, 'u'},
+    {"enable-optimization", required_argument, 0, 'K'},
     {"error",        required_argument, 0, 'E'},
     {"json",         no_argument,       0, 'J'},
     {"print-prefix", no_argument,       0, 'x'},
@@ -208,6 +211,67 @@ static char const * g_opt_str =
 ; // NOLINT
 
 namespace lean {
+
+#ifndef LEAN_WINDOWS
+// Nodes remain alive until process exit so the signal handler never observes freed paths.
+struct eoi_cleanup {
+    std::vector<std::string> paths;
+    std::atomic<bool> active{true};
+    eoi_cleanup * next;
+};
+static std::atomic<eoi_cleanup *> g_eoi_cleanup{nullptr};
+static std::once_flag g_eoi_signals;
+static_assert(std::atomic<eoi_cleanup *>::is_always_lock_free);
+static_assert(std::atomic<bool>::is_always_lock_free);
+
+static void cleanup_eoi_files() {
+    for (auto p = g_eoi_cleanup.load(); p; p = p->next)
+        if (p->active.load())
+            for (auto const & path : p->paths)
+                unlink(path.c_str());
+}
+
+static void eoi_signal(int sig) {
+    cleanup_eoi_files();
+    _exit(128 + sig);
+}
+#endif
+
+extern "C" LEAN_EXPORT uint64_t lean_eoi_register_files(obj_arg paths) {
+#ifndef LEAN_WINDOWS
+    std::call_once(g_eoi_signals, [] {
+        std::atexit(cleanup_eoi_files);
+        struct sigaction action = {};
+        action.sa_handler = eoi_signal;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGINT, &action, nullptr);
+        sigaction(SIGTERM, &action, nullptr);
+    });
+    auto p = new eoi_cleanup;
+    for (size_t i = 0; i < lean_array_size(paths); ++i)
+        p->paths.emplace_back(lean_string_cstr(lean_array_get_core(paths, i)));
+    p->next = g_eoi_cleanup.load();
+    while (!g_eoi_cleanup.compare_exchange_weak(p->next, p)) {}
+    lean_dec(paths);
+    return reinterpret_cast<uint64_t>(p);
+#else
+    lean_dec(paths);
+    return 0;
+#endif
+}
+
+extern "C" LEAN_EXPORT obj_res lean_eoi_finish_files(uint64_t handle, uint8_t abort) {
+#ifndef LEAN_WINDOWS
+    auto p = reinterpret_cast<eoi_cleanup *>(handle);
+    if (p) {
+        if (abort)
+            for (auto const & path : p->paths)
+                unlink(path.c_str());
+        p->active.store(false);
+    }
+#endif
+    return lean_box(0);
+}
 extern "C" obj_res lean_shell_main(obj_arg args, obj_arg shell_opts);
 int run_shell_main(int argc, char* argv[], object_ref const & shell_opts) {
     list_ref<string_ref> args;

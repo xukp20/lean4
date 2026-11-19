@@ -50,6 +50,8 @@ public structure LakeOptions where
   leanInstall? : Option LeanInstall := none
   lakeInstall? : Option LakeInstall := none
   configOpts : NameMap String := {}
+  enableEOIEarlyOlean : Bool := false
+  optimizationScopeRoot : Bool := false
   packageOverrides : Array PackageEntry := #[]
   subArgs : List String := []
   wantsHelp : Bool := false
@@ -434,6 +436,26 @@ def lakeOption :=
   option {
     short := lakeShortOption
     long := lakeLongOption
+    longShort := shortOptionWithArg lakeShortOption
+  }
+
+private def lakeBuildOption :=
+  option {
+    short := lakeShortOption
+    long := fun opt => do
+      if opt == "--enable-optimization" then
+        let name ← takeOptArg opt "optimization name"
+        match name with
+        | "eoi-early-olean" =>
+          modifyThe LakeOptions fun opts => {opts with enableEOIEarlyOlean := true}
+        | _ => error s!"unknown optimization '{name}' for --enable-optimization"
+      else if opt == "--optimization-scope" then
+        let scope ← takeOptArg opt "optimization scope"
+        unless scope == "root" do
+          error s!"unknown optimization scope '{scope}' for --optimization-scope"
+        modifyThe LakeOptions fun opts => {opts with optimizationScopeRoot := true}
+      else
+        lakeLongOption opt
     longShort := shortOptionWithArg lakeShortOption
   }
 
@@ -960,7 +982,7 @@ protected def init : CliM PUnit := do
   noArgsRem do init name tmp lang (← opts.computeEnv) opts.rootDir opts.offline
 
 protected def build : CliM PUnit := do
-  processOptions lakeOption
+  processOptions lakeBuildOption
   let opts ← getThe LakeOptions
   let config ← mkLoadConfig opts
   let ws ← loadWorkspace config
@@ -982,6 +1004,11 @@ protected def build : CliM PUnit := do
     | none, some _ => error "`--package` requires `-o`"
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
+  let buildConfig :=
+    if !opts.enableEOIEarlyOlean then buildConfig
+    else
+      let eoiEarlyOleanPackages := ({} : Lean.NameSet).insert ws.root.baseName
+      {buildConfig with eoiEarlyOleanPackages}
   ws.runBuild (buildSpecs specs) buildConfig
 
 protected def checkBuild : CliM PUnit := do
@@ -1422,7 +1449,7 @@ def lake : CliM PUnit := do
   | _ => -- normal CLI
     processLeadingOptions lakeOption -- between `lake` and command
     if let some cmd ← takeArg? then
-      processLeadingOptions lakeOption -- between `lake <cmd>` and args
+      processLeadingOptions (if cmd == "build" then lakeBuildOption else lakeOption)
       if (← getWantsHelp) then
         IO.println <| help cmd
       else

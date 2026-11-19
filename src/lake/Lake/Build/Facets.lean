@@ -115,6 +115,17 @@ public structure ModuleExportInfo where
 /-- **For internal use only.** Information useful to importers of this module. -/
 builtin_facet exportInfo : Module => ModuleExportInfo
 
+/-- Internal provisional public artifact, completed by the compiler or the full job. -/
+builtin_facet eoiOLean : Module => Artifact
+
+/-- Public-only import information that does not demand meta or private artifacts. -/
+builtin_facet earlyExportInfo : Module => ModuleExportInfo
+
+/-- Dependencies of a provisional module compilation. -/
+builtin_facet earlyImportInfo : Module => ModuleImportInfo
+
+
+
 /-- Artifacts directly needed for an `import` of this module with the module system enabled. -/
 builtin_facet importArts : Module => ImportArtifacts
 

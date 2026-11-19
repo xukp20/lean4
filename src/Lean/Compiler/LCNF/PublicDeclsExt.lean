@@ -39,7 +39,7 @@ public def isDeclPublic (env : Environment) (declName : Name) : Bool := Id.run d
   let inferFor := match declName with
     | .str n "_boxed" => n
     | n               => n
-  let (_, map) := publicDeclsExt.getState env
+  let (_, map) := publicDeclsExt.getState (asyncMode := if env.eoiExporting then .local else .sync) env
   map.contains inferFor
 
 public def setDeclPublic (env : Environment) (declName : Name) : Environment :=

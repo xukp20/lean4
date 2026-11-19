@@ -120,6 +120,9 @@ def helpBuild :=
 USAGE:
   lake build [<targets>...] [-o <mappings>] [--package <name>]
 
+  --enable-optimization=eoi-early-olean    enable provisional public interfaces for module jobs
+  --optimization-scope=root   restrict enabled optimizations to the root package (default: workspace)
+
 A target is specified with a string of the form:
 
   [@[<package>]/][<target>|[+]<module>][:<facet>]

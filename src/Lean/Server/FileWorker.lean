@@ -463,7 +463,7 @@ section Initialization
           -- Emit a refresh request after a file worker restart.
           pendingRefreshInfo? := some { lastRefreshTimestamp := timestamp, successiveRefreshAttempts := 0 }
         })
-    let processor := Language.Lean.process (setupImports doc opts chanOut)
+    let processor := Language.Lean.process (setupImports doc opts chanOut) (moduleJobConfig := {})
     let processor ← Language.mkIncrementalProcessor processor
     let initSnap ← processor doc.mkInputContext
     let _ ← ServerTask.IO.asTask do

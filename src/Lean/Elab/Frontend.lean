@@ -11,6 +11,9 @@ public import Lean.Language.Lean
 public import Lean.Server.References
 public import Lean.Util.Profiler
 import Lean.Compiler.Options
+import Lean.Compiler.IR.CompilerM
+import Lean.Compiler.NoncomputableAttr
+import Lean.Util.CollectAxioms
 import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
@@ -266,6 +269,51 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
+private partial def hasReadyEOIErrors (tree : Language.SnapshotTree)
+    (overrides : NameMap MessageSeverity) : BaseIO Bool := do
+  let log := tree.element.diagnostics.msgLog
+  if log.reportedPlusUnreported.any (fun msg =>
+      (overrides.find? msg.kind |>.getD msg.severity) == .error) then
+    return true
+  for child in tree.children do
+    if let some ready ← child.get? then
+      if ← hasReadyEOIErrors ready overrides then return true
+  return false
+
+private def checkedWithin (checked : Task α) (graceMs : UInt32) : IO Bool := do
+  if ← IO.hasFinished checked then return true
+  if graceMs == 0 then return false
+  let timer ← IO.asTask (IO.sleep graceMs) (prio := .dedicated)
+  IO.waitAny [checked.map (sync := true) fun _ => true, timer.map (sync := true) fun _ => false]
+
+private def inductiveChecksPassed (checks : Array InductiveCheckObligation) : Bool :=
+  checks.all (·.status == .passed)
+
+private def formalPublicationAllowed (hasErrors : Bool) (checks : Array InductiveCheckObligation) :
+    Bool :=
+  !hasErrors && inductiveChecksPassed checks
+
+private def reportUnpassedInductiveChecks (checks : Array InductiveCheckObligation)
+    (fileName : String) (opts : Options) (jsonOutput : Bool) : IO Unit := do
+  let mut msgs : MessageLog := .empty
+  for check in checks do
+    let reason ← match check.status with
+      | .passed => continue
+      | .pending => pure "is still pending"
+      | .failed => pure "failed"
+      | .cancelled => pure "was interrupted"
+    msgs := msgs.add {
+      fileName
+      pos := ⟨1, 0⟩
+      severity := .error
+      data := m!"complete kernel check for inductive '{check.name}' {reason}"
+    }
+  let report : Language.SnapshotTree := .mk {
+    desc := "inductive kernel checks"
+    diagnostics := ← Language.Snapshot.Diagnostics.ofMessageLog msgs
+  } #[]
+  discard <| report.runAndReport opts jsonOutput
+
 def runFrontend
     (input : String)
     (opts : Options)
@@ -282,7 +330,10 @@ def runFrontend
     (incrSaveFileName? : Option System.FilePath := none)
     (incrLoadFileName? : Option System.FilePath := none)
     (incrHeaderSaveFileName? : Option System.FilePath := none)
+    (moduleJobConfig : ModuleJobConfig := {})
     : IO (Option Environment) := do
+  if moduleJobConfig.eoiEarlyOlean && System.Platform.isWindows then
+    throw <| IO.userError "EOI early olean requires POSIX interruption cleanup"
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
@@ -290,7 +341,7 @@ def runFrontend
   let opts := Lean.internal.cmdlineSnapshots.setIfNotSet opts incrSaveFileName?.isNone
   -- default to async elaboration; see also `Elab.async` docs
   let opts := Elab.async.setIfNotSet opts true
-  let ctx := { inputCtx with }
+  let ctx : Language.ProcessingContext := { inputCtx with }
   let setup stx := do
     if let some setup := setup? then
       liftM <| setup.dynlibs.forM Lean.loadDynlib
@@ -332,13 +383,84 @@ def runFrontend
       -- imports) calls `importModules`, which in turn requires the flag to be set. Restore it.
       unsafe enableInitializersExecution
     return snap
-  let processor := Language.Lean.process
-  let snap ← processor setup old? ctx
+  let snap ← Language.Lean.process setup old? (moduleJobConfig := moduleJobConfig) ctx
   let snaps := Language.toSnapshotTree snap
   let severityOverrides := errorOnKinds.foldl (·.insert · .error) {}
 
+  let mut early? : Option (ModuleData × Compactor) := none
+  let mut earlyTime := 0
+  let mut skipReason := "no-final-state"
+  if moduleJobConfig.eoiEarlyOlean then
+    if let some state := Language.Lean.waitForFinalCmdState? snap then
+      if let some fname := oleanFileName? then
+        let compilerResult ← match state.env.eoiCompilerState? with
+          | some compiler => IO.wait compiler.task
+          | none => pure default
+        let readyErrors ← hasReadyEOIErrors snaps severityOverrides
+        let leaf := (← IO.getEnv "LEAN_EOI_LEAF") == some "1"
+        let checked ← if leaf then pure false else checkedWithin state.env.checked 0
+        skipReason := if !state.env.header.isModule then "non-module"
+          else if state.messages.hasErrors || readyErrors then "synchronous-error"
+          else if leaf then "no-interface-consumer"
+          else if checked then "already-checked" else "public-realization-before-eoi"
+        if state.env.header.isModule && !state.messages.hasErrors && !leaf && !checked && !readyErrors then
+          if let some ref := state.env.eoiState? then
+            unless (← ref.get).fallback do
+              let eoiEnv := state.env.withEOICompilerExport compilerResult
+              let eoiEnv := compilerResult.noncompDecls.foldl (init := eoiEnv) fun env decl =>
+                noncomputableExt.addEntry (asyncMode := .local) env decl
+              let parserExt := Parser.parserExtension.ext
+              let parserEntries := parserExt.exportEntriesFn eoiEnv
+                (parserExt.getState (asyncMode := .local) eoiEnv)
+              let irDecls := IR.declMapExt.getState (asyncMode := .local) eoiEnv
+              if parserEntries.exported.any (fun
+                  | .global (.parser _ declName _)
+                  | .scoped _ (.parser _ declName _) =>
+                    (eoiEnv.getModuleIdxFor? declName).isNone && !irDecls.contains declName
+                  | _ => false) then
+                skipReason := "missing-parser-ir"
+              else
+                let data ← mkExportedModuleDataEOI eoiEnv
+                let canExport ← ref.modifyGet fun s =>
+                  (!s.fallback, if s.fallback then s else { s with sealed := true })
+                if canExport then
+                  for suffix in #["axioms", "eoi"] do
+                    let path := fname.addExtension suffix
+                    if ← path.pathExists then IO.FS.removeFile path
+                  IO.FS.writeFile (fname.addExtension "eoi") (toString (← IO.Process.getPID))
+                  let compactor ← unsafe CompactedRegion.save fname state.env.mainModule data #[] none
+                    (deferredAxioms := true)
+                  if (← ref.get).fallback then
+                    throw <| IO.userError "EOI interface invalidated during serialization"
+                  early? := some (data, compactor)
+                  earlyTime ← IO.monoMsNow
+                  skipReason := "early"
+                  IO.println <| (Json.mkObj [
+                    ("kind", toJson "lean.eoiReady"),
+                    ("module", toJson state.env.mainModule.toString),
+                    ("olean", toJson fname.toString),
+                    ("early", toJson true)]).compress
+                  (← IO.getStdout).flush
+
   -- reporting should be done before any early exit from the function
   let hasErrors ← snaps.runAndReport opts jsonOutput severityOverrides
+  if moduleJobConfig.eoiEarlyOlean then
+    if let some state := Language.Lean.waitForFinalCmdState? snap then
+      if let some fname := oleanFileName? then
+        if let some ref := state.env.eoiState? then
+          let stats ← ref.get
+          let doneTime ← IO.monoMsNow
+          IO.FS.writeFile (fname.addExtension "eoi.stats.json") <| (Json.mkObj [
+            ("early", toJson early?.isSome), ("reason", toJson skipReason),
+            ("fallback", toJson stats.fallback), ("privateRealizations", toJson stats.privateRealizations),
+            ("suppressed", toJson stats.suppressed), ("escaped", toJson stats.escaped),
+            ("readyMs", toJson earlyTime), ("doneMs", toJson doneTime),
+            ("windowMs", toJson (if early?.isSome then doneTime - earlyTime else 0)),
+            ("proofFailed", toJson hasErrors)]).compress
+  if hasErrors && early?.isSome then
+    if let some fname := oleanFileName? then
+      for path in #[fname, fname.addExtension "axioms", fname.addExtension "eoi"] do
+        if ← path.pathExists then IO.FS.removeFile path
 
   let some cmdState := Language.Lean.waitForFinalCmdState? snap
     | return none
@@ -362,31 +484,44 @@ def runFrontend
     IO.FS.writeFile (incrFile.addExtension "deps") (toJson moduleArts).compress
     Runtime.forget compactor
 
-  -- save full incremental snapshot for next invocation
-  if let some incrFile := incrSaveFileName? then
-    -- Per-command `CancelToken`s are left unresolved on success; their internal `Promise`
-    -- tasks would block the compactor's `lean_task_get`. Fire them all before save.
-    -- `truncateToHeader` discards everything below the header so this isn't needed for the
-    -- header-only save below.
-    resolveCancelTokensForSave (Language.toSnapshotTree snap)
-    saveSnap incrFile snap
+  let inductiveChecks ← getInductiveChecks env
+  if inductiveChecksPassed inductiveChecks then
+    if incrSaveFileName?.isSome || incrHeaderSaveFileName?.isSome then
+      discardCompletedInductiveChecks env
 
-  -- save header-only snapshot (skips elaborated command bodies)
-  if let some incrFile := incrHeaderSaveFileName? then
-    saveSnap incrFile (Language.Lean.truncateToHeader snap)
+    -- save full incremental snapshot for next invocation
+    if let some incrFile := incrSaveFileName? then
+      -- Per-command `CancelToken`s are left unresolved on success; their internal `Promise`
+      -- tasks would block the compactor's `lean_task_get`. Fire them all before save.
+      -- `truncateToHeader` discards everything below the header so this isn't needed for the
+      -- header-only save below.
+      resolveCancelTokensForSave (Language.toSnapshotTree snap)
+      saveSnap incrFile snap
 
-  -- stats should be displayed even if there are (non-import) errors
-  if printStats then
-    env.displayStats
+    -- save header-only snapshot (skips elaborated command bodies)
+    if let some incrFile := incrHeaderSaveFileName? then
+      saveSnap incrFile (Language.Lean.truncateToHeader snap)
 
-  if hasErrors then
+    -- stats should be displayed even if there are (non-import) errors
+    if printStats then
+      env.displayStats
+
+  if !formalPublicationAllowed hasErrors inductiveChecks then
+    unless hasErrors do
+      reportUnpassedInductiveChecks inductiveChecks fileName opts jsonOutput
     return none
 
   if let some oleanFileName := oleanFileName? then
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+      if let some (early, _) := early? then
+        validateEOIConstants env early
+      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts)
+        (early? := early?) env oleanFileName
+      if early?.isSome then
+        writeEOIAxioms env oleanFileName
+        IO.FS.removeFile (oleanFileName.addExtension "eoi")
 
   if let some ileanFileName := ileanFileName? then
     let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])

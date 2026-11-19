@@ -8,6 +8,7 @@ prelude
 public import Lean.Elab.Deriving.Basic
 public import Lean.Elab.PreDefinition.Main
 import all Lean.Elab.ErrorUtils
+import all Lean.OriginalConstKind
 public section
 namespace Lean.Elab
 open Lean.Parser.Term
@@ -1192,6 +1193,17 @@ register_builtin_option warn.redundantExpose : Bool := {
   descr    := "warn about redundant `@[expose]`/`@[no_expose]` attributes"
 }
 
+/-- The last identifier component also covers self references through field notation. -/
+private partial def proofMayRecurse (declName : Name) (body : Syntax) : Bool :=
+  if body.isIdent then
+    match body.getId.eraseMacroScopes, declName with
+    | .str _ ref, .str _ decl => ref == decl
+    | _, _ => false
+  else
+    body.getArgs.any (proofMayRecurse declName)
+
+/- Recursive public theorems can generate publicly resolvable recursor helpers. Keep these
+   declarations in the main environment so they can be included before sealing the interface. -/
 def elabMutualDef (vars : Array Expr) (sc : Command.Scope) (views : Array DefView) : TermElabM Unit :=
   if isExample views then
     withoutModifyingEnv do
@@ -1234,7 +1246,10 @@ where
             setReducibilityStatus header.declName .instanceReducible
 
     if let (#[view], #[declId]) := (views, expandedDeclIds) then
-      if Elab.async.get (← getOptions) && view.kind.isTheorem &&
+      let preservePublicHelpers := view.kind.isTheorem &&
+        (← getEnv).moduleJobConfig.eoiEarlyOlean && !isPrivateName declId.declName &&
+        proofMayRecurse declId.declName.eraseMacroScopes view.value
+      if Elab.async.get (← getOptions) && view.kind.isTheorem && !preservePublicHelpers &&
           !deprecated.oldSectionVars.get (← getOptions) &&
           -- holes in theorem types is not a fatal error, but it does make parallelism impossible
           !headers[0]!.type.hasMVar then
@@ -1297,6 +1312,10 @@ this warning can be disabled with `set_option warn.classDefReducibility false`."
 
       async.commitSignature { name := header.declName, levelParams, type }
 
+    if (← getEnv).moduleJobConfig.eoiEarlyOlean then
+      modifyEnv (privateConstKindsExt.insert · header.declName .thm)
+      snapshotEnvLinterOptions header.declName
+
     -- attributes should be applied on the main thread; see below
     -- save before clearing so the deprecation-silencing wrap below can still see `@[deprecated]`
     let oldAttrs := header.modifiers.attrs
@@ -1319,7 +1338,7 @@ this warning can be disabled with `set_option warn.classDefReducibility false`."
       withDeclName header.declName do
       wrapAsyncAsSnapshot (desc := s!"elaborating proof of {declId.declName}")
         (cancelTk? := cancelTk) fun _ => do profileitM Exception "elaboration" (← getOptions) do
-      setEnv async.asyncEnv
+      setEnv async.asyncEnv.enterAsyncTheorem
       try
         finishElab #[header]
       finally

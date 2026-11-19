@@ -228,7 +228,8 @@ def getSorryDep (env : Environment) (declName : Name) : Option Name :=
 @[export lean_get_ir_extra_const_names]
 private def getIRExtraConstNames (env : Environment) (level : OLeanLevel) (includeDecls := false) : Array Name :=
   let env := env.setExporting (level == .exported)
-  declMapExt.getEntries env |>.toArray.map (·.name)
+  declMapExt.getEntries (asyncMode := if env.eoiExporting then .local else .sync) env
+    |>.toArray.map (·.name)
     |>.filter fun n => (includeDecls || !env.contains n) &&
       (level == .private || Compiler.LCNF.isDeclPublic env n || isDeclMeta env n)
 
