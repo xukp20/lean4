@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lake.Util.Exit
+public import Lean.ModuleJobConfig
 public import Lake.Load.Config
 public import Lake.CLI.Error
 public import Lake.CLI.Shake
