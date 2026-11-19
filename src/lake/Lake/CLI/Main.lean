@@ -373,6 +373,9 @@ def lakeLongOption : (opt : String) → CliM PUnit
 | "--file"        => do
   let configFile ← takeOptArg "--file" "path"
   modifyThe LakeOptions ({· with configFile})
+| "--eoi-early-olean" => do
+  modifyThe LakeOptions fun opts =>
+    {opts with moduleJobConfig := opts.moduleJobConfig.withEOIEarlyOLean}
 | "--profile-trace" => do
   let dir ← takeOptArg "--profile-trace" "profiler output directory"
   if dir.isEmpty then error "profile trace directory must not be empty"

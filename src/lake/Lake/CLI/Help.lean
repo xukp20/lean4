@@ -47,6 +47,7 @@ COMMANDS:
   serve                 start the Lean language server
 
 BASIC OPTIONS:
+  --eoi-early-olean    overlap ordinary cold module elaboration with postponed import IR
   --profile-trace=dir   write per-process unified profiler traces (non-semantic)
   --profile-level=level macro, tactic (default) or defeq
   --profile-slow-us=num minimum retained fine-grained duration (default: 200)

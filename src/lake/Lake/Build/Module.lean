@@ -612,7 +612,7 @@ Recursively build a module's dependencies, including:
 * Shared libraries (e.g., `extern_lib` targets or precompiled modules)
 * `extraDepTargets` of its library
 -/
-def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensureJob do
+private def Module.fetchPreSetupWith (mod : Module) (imports : FetchM (Job ModuleImportInfo)) : FetchM (Job ModulePreSetup) := ensureJob do
   /-
   Remark: Await extra target dependencies (e.g., cloud releases, `needs`) before any
   other module processing. This both enables the dependencies to effect these elements
@@ -632,7 +632,7 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
   precompiled imports so that errors in the import block of transitive imports
   will not kill this job before the direct imports are built.
   -/
-  let impInfoJob ← mod.importInfo.fetch
+  let impInfoJob ← imports
 
   /-
   Remark: It should be possible to avoid transitive imports here when the module
@@ -696,6 +696,9 @@ where
     opts.values.foldl (init := .nil caption) fun t n v =>
       let opt := s!"-D{n}={v.asCliFlagValue}"
       t.mix <| .ofHash (pureHash opt) opt
+
+def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) :=
+  mod.fetchPreSetupWith mod.importInfo.fetch
 
 /-- The `ModuleFacetConfig` for the builtin `presetupFacet`. -/
 public def Module.presetupFacetConfig : ModuleFacetConfig presetupFacet :=
@@ -1101,22 +1104,24 @@ def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
 public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   mkFacetJobConfig recBuildLtar
 
-def Module.buildLean
-  (mod : Module) (presetup : ModulePreSetup)
-: JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
+private def Module.compilerArgs (mod : Module) : JobM (Array String) := do
   let args := mod.weakLeanArgs ++ mod.leanArgs
   -- Append only after recFetchPreSetup has computed Module.trace.
   let cfg := (← getBuildContext).moduleJobConfig
-  let args := if let some dir := cfg.profileTrace? then
+  return if let some dir := cfg.profileTrace? then
     let level := if cfg.profileLevel == 0 then "macro" else if cfg.profileLevel == 2 then "defeq" else "tactic"
     args ++ #[s!"--profile-trace={dir}", s!"--profile-level={level}", s!"--profile-slow-us={cfg.profileSlowUs}"]
   else args
+
+def Module.buildLean
+  (mod : Module) (presetup : ModulePreSetup)
+: JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← mkModuleSetup mod presetup
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   mod.clearOutputHashes
-  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
+  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts (← mod.compilerArgs)
     (← getLeanPath) (← getLean)
   mod.computeArtifacts setup.isModule presetup.postponeCompile
 
@@ -1128,6 +1133,70 @@ def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM Mo
     return arts
   | .error e =>
     error s!"failed to retrieve module artifact modification time: {e}"
+
+/-- A command-line elaborator with a single ordinary local import can read its
+committed public olean while postponed code generation finishes. Restrict the
+producer to modules without workspace imports so a transitive meta/all edge
+cannot widen this view. Keep the public-only setup private to this invocation. -/
+private def Module.earlyPublicSetup? (mod : Module) : FetchM (Option (Job ModulePreSetup)) := do
+  unless (← getBuildContext).moduleJobConfig.eoiEarlyOlean do return none
+  if (← getNoBuild) || (← getIsOldMode) || (← mod.pkg.isArtifactCacheReadable) ||
+      (← mod.traceFile.pathExists) || (← mod.oleanFile.pathExists) ||
+      (← mod.ltarFile.pathExists) then return none
+  let input ← (← mod.input.fetch).await
+  unless input.header.isModule do return none
+  let #[imp] := input.imports.filter (·.module?.isSome) | return none
+  if imp.isMeta || imp.importAll then return none
+  let #[producer] ← findModules imp.module | return none
+  if producer.name == mod.name then return none
+  let upstream ← (← producer.input.fetch).await
+  unless upstream.header.isModule && producer.postponeCompile &&
+      !upstream.imports.any (·.module?.isSome) do return none
+  let job ← mod.fetchPreSetupWith do
+    (← producer.exportInfo.fetch).mapM (sync := true) fun pub => do
+      let info := ModuleImportInfo.nil mod.name
+      return {info with
+        directArts := info.directArts.insert imp.module pub.arts
+        trace := info.trace.mix pub.transTrace |>.mix pub.artsTrace.withoutInputs}
+  return some job
+
+private def Module.buildEarlyPublic (mod : Module) (early : ModulePreSetup)
+    (finalJob : Job ModulePreSetup) : JobM ModuleOutputArtifacts := do
+  setTrace early.trace
+  IO.FS.withTempDir fun dir => do
+    buildAction early.trace mod.traceFile do
+      let setup ← mkModuleSetup mod early
+      let path := dir / "module.olean"
+      let ilean := dir / "module.ilean"
+      let bc := dir / "module.bc"
+      let arts : ModuleArtifacts := {olean? := some path, ilean? := some ilean,
+        bc? := if Lean.Internal.hasLLVMBackend () then some bc else none}
+      compileLeanModule early.srcFile (relPathFrom mod.pkg.dir early.srcFile) setup
+        (dir / "setup.json") arts (← mod.compilerArgs) (← getLeanPath) (← getLean)
+      -- Only the canonical presetup has the complete IR signature and all
+      -- final dependency jobs. An exception here discards the staged files.
+      let final ← finalJob.await
+      unless final.trace.hash == early.trace.hash do error "public import trace changed"
+      let finalSetup ← mkModuleSetup mod final
+      createParentDirs mod.setupFile
+      IO.FS.writeFile mod.setupFile (toJson finalSetup).pretty
+      mod.clearOutputArtifacts
+      mod.clearOutputHashes
+      try
+        for (src, dst) in #[(path, mod.oleanFile),
+            (OLeanLevel.server.adjustFileName path, mod.oleanServerFile),
+            (OLeanLevel.private.adjustFileName path, mod.oleanPrivateFile),
+            (ilean, mod.ileanFile)] do
+          createParentDirs dst
+          copyFile src dst
+        if arts.bc?.isSome then
+          createParentDirs mod.bcFile
+          copyFile bc mod.bcFile
+        mod.computeArtifacts true true
+      catch e =>
+        mod.clearOutputArtifacts
+        mod.clearOutputHashes
+        throw e
 
 inductive ModuleFetchState
 | complete (arts : ModuleOutputArtifacts)
@@ -1146,6 +1215,14 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
   -/
   withRegisterJob mod.name.toString do
   let presetupJob ← mod.presetup.fetch
+  if let some earlyJob ← mod.earlyPublicSetup? then
+    return ← earlyJob.mapM fun early => do
+      if early.postponeCompile then
+        adjustMTime (← mod.buildEarlyPublic early presetupJob) mod.traceFile
+      else
+        let final ← presetupJob.await
+        setTrace final.trace
+        adjustMTime (← fetchCore final) mod.traceFile
   presetupJob.mapM fun presetup => do
     setTrace presetup.trace
     let arts ← fetchCore presetup
@@ -1322,7 +1399,23 @@ def Module.recBuildIRArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) :=
       IO.FS.writeFile mod.irSetupFile (toJson irSetup).pretty
       mod.clearIROutputArtifacts
       mod.clearIROutputHashes
-      compileLeanIR mod.irSetupFile mod.irFile mod.cFile (← getLeanPath) (← getLeanir)
+      if (← getBuildContext).moduleJobConfig.eoiEarlyOlean then
+        removeFileIfExists mod.irTraceFile
+        IO.FS.withTempDir fun dir => do
+          let ir := dir / "module.ir"
+          let c := dir / "module.c"
+          compileLeanIR mod.irSetupFile ir c (← getLeanPath) (← getLeanir)
+          try
+            createParentDirs mod.cFile
+            copyFile (ir.addExtension "sig") mod.irSigFile
+            copyFile c mod.cFile
+            -- Lake checks irFile for reuse. Install it last.
+            copyFile ir mod.irFile
+          catch e =>
+            mod.clearIROutputArtifacts
+            throw e
+      else
+        compileLeanIR mod.irSetupFile mod.irFile mod.cFile (← getLeanPath) (← getLeanir)
     let arts ← mod.computeIRArtifacts elabArts upToDate
     let arts ← adjustMTime arts mod.irTraceFile
     let arts ← trackOutputsIfEnabled arts
