@@ -14,6 +14,7 @@ Author: Leonardo de Moura
 #include <lean/lean.h>
 #include "runtime/object.h"
 #include "runtime/thread.h"
+#include "runtime/available_parallelism.h"
 #include "runtime/utf8.h"
 #include "runtime/alloc.h"
 #include "runtime/debug.h"
@@ -1160,6 +1161,10 @@ static unsigned get_lean_num_threads() {
 /* getHardwareConcurrency (_ : Unit) : UInt32 */
 extern "C" LEAN_EXPORT uint32 lean_internal_get_hardware_concurrency(obj_arg) {
     return hardware_concurrency();
+}
+
+extern "C" LEAN_EXPORT uint32 lean_internal_get_available_parallelism(obj_arg) {
+    return available_parallelism();
 }
 
 extern "C" LEAN_EXPORT void lean_init_task_manager() {
